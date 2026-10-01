@@ -1,0 +1,35 @@
+# fleet-watch.conf for the ARDUINO Q.
+# Copy to ~/fleet-watch/fleet-watch.conf on the Q and edit the marked lines.
+# Keep this file chmod 600: it holds your ntfy URL.
+
+# Host (as SSH understands it) of the OTHER monitor. Use the exact same
+# string here and in FLEET_HOSTS on the other box if you list it there.
+PEER_HOST="paul@192.168.1.109"
+
+# Other fleet boxes to check (space-separated, as SSH understands them).
+# Do NOT include PEER_HOST here; the peer is checked via heartbeat.
+# EDIT to match your real hostnames:
+FLEET_HOSTS="paul@paul-Vostro-260a paul@paul-OptiPlex-7010"
+
+# Your ntfy topic URL. EDIT: e.g. https://ntfy.sh/my-fleet-topic
+# or https://ntfy.example.com/my-fleet-topic
+NTFY_URL="https://ntfy.sh/REPLACE_WITH_YOUR_TOPIC"
+
+# Small model on THIS box used for triage.
+MODEL="qwen3:1.7b"
+
+# Where duel logs live on THIS box.
+DUEL_DIR="$HOME/dual"
+
+# Check cadence (should match the cron interval) and thresholds.
+INTERVAL_MIN=10
+DISK_WARN=85
+DISK_CRIT=95
+# A duel whose log hasn't grown in this long (minutes) is suspicious.
+# Small models at 2-3 tok/s can take 20+ min per turn; 60 is conservative.
+STUCK_AFTER_MIN=60
+
+OLLAMA_HOST="http://localhost:11434"
+
+# Set to 1 for a test run: prints what WOULD be sent, sends nothing.
+DRY_RUN=0
