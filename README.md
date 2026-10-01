@@ -24,8 +24,16 @@ Every run (cron, every 10 minutes):
    triage names what's eating the space (model blobs, logs, journals)
    and suggests concrete cleanup commands, cheapest first.
 
-## Alert discipline
+## Coexistence with duels
 
+The health checks and heartbeats are plain SSH — no impact on running
+duels. The triage model call only fires when something already looks
+wrong, and it reuses the already-loaded model when it can. If a duel is
+mid-turn with a *different* model in memory, the triage call is skipped
+entirely (loading two models at once OOM-killed small boxes before) and
+the alert goes out with the rule-based findings instead.
+
+## Alert discipline
 - Alerts fire **only on state changes** — no repeat spam for the same
   ongoing issue (one reminder if it's still broken after 6h).
 - A "recovered" note goes out when things clear, so silence stays trustworthy.

@@ -264,7 +264,17 @@ if [ "$SEV" = "OK" ]; then
   state_set last_verdict "OK"
   log "OK"
 else
-  ANSWER=$(call_model)
+  # OOM safety: if a duel is mid-turn with a *different* model loaded,
+  # don't ask Ollama to load the triage model too — two 1.7B models in
+  # memory OOM-killed these boxes before. Fall back to the rule-based
+  # verdict instead (the VERDICT parse below handles the empty answer).
+  ANSWER=""
+  if ! pgrep -f "[o]llama_duel.py" >/dev/null 2>&1 \
+     || ollama ps 2>/dev/null | grep -q "$MODEL"; then
+    ANSWER=$(call_model)
+  else
+    log "triage model call skipped: duel active with another model loaded"
+  fi
   VERDICT=$(echo "$ANSWER" | grep -i -m1 "^VERDICT:" || true)
   if [ -z "$VERDICT" ]; then
     # Model unavailable or misbehaved: fall back to the raw flags.
