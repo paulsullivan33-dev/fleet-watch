@@ -71,6 +71,7 @@ notify() { # $1=priority $2=title $3=message [$4=tags]
   local pri=$1 title=$2 msg=$3 tags=${4:-satellite}
   if [ "$DRY_RUN" = "1" ]; then
     echo "DRY-RUN ntfy pri=$pri [$title]: $(echo "$msg" | head -3 | tr '\n' '|')"
+    log "DRY-RUN would send ntfy (pri $pri): $title"
     return 0
   fi
   if curl -s -m 15 -H "Title: $title" -H "Priority: $pri" -H "Tags: $tags" \
