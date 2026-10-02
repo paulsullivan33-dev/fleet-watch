@@ -10,7 +10,8 @@ something needs attention.
 Every run (cron, every 10 minutes):
 
 1. **Health checks** over passwordless SSH: reachability, load vs cores,
-   disk, memory, OOM kills, Ollama API, temperature.
+   disk, memory, OOM kills from the last 24h (`OOM_WINDOW_HOURS`),
+   Ollama API, temperature.
 2. **Stuck-job detection**: a duel/inference process alive plus its progress
    log not growing plus the inference server pegged = stuck (CRIT).
    A stale log with an idle server = probably loading the next model (WARN).
