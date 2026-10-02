@@ -16,7 +16,8 @@ FLEET_HOSTS="paul@paul-Vostro-260a paul@paul-OptiPlex-7010"
 NTFY_URL="https://ntfy.sh/REPLACE_WITH_YOUR_TOPIC"
 
 # Small model on THIS box used for triage.
-MODEL="smollm2:1.7b"
+# qwen3:1.7b: smollm2:1.7b just echoes the prompt instead of answering.
+MODEL="qwen3:1.7b"
 
 # Where duel logs live on THIS box.
 DUEL_DIR="$HOME/dual"
