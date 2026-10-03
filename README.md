@@ -60,6 +60,21 @@ ssh user@box 'cd ~/fleet-watch && mv fleet-watch.conf.q fleet-watch.conf \
   && chmod +x fleet-watch.sh && chmod 600 fleet-watch.conf'
 ```
 
+Passwordless SSH is required in *both* directions, not just from your
+workstation: your workstation -> each monitor (install, debug), **and**
+each monitor -> the other monitor (the peer heartbeat check runs over
+SSH and uses `BatchMode=yes`, so a password prompt means a failed check).
+
+```bash
+# if a monitor has no keypair yet:
+ssh user@box1 'ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519'
+# then exchange keys both ways (one-time password prompt each):
+ssh user@box1 'ssh-copy-id user@box2'
+ssh user@box2 'ssh-copy-id user@box1'
+# sanity check (should print a number, not an error):
+ssh user@box1 "ssh -o BatchMode=yes user@box2 'cat ~/.fleet-watch/heartbeat'"
+```
+
 Verify the copy, set `DRY_RUN=1` in the conf, and run once by hand — it
 prints what it *would* send without touching ntfy. Then flip `DRY_RUN`
 off and add to cron on both boxes:
