@@ -6,7 +6,8 @@
 # Each run:
 #   1. Checks local health + fleet health over SSH (load, disk, mem,
 #      OOM kills, Ollama API, temperature).
-#   2. Watches for stuck duels: duel process alive + run_results.log
+#   2. Watches duels: alerts when a duel starts/ends (with the scenario
+#      name), and flags stuck duels: duel process alive + run_results.log
 #      not growing + llama-server pegged = stuck.
 #   3. Checks the peer monitor's heartbeat (Q watches Pi, Pi watches Q).
 #   4. If anything looks off, asks the local small model to triage and
@@ -184,9 +185,52 @@ check_host() { # $1=host $2=label
   fi
 }
 
+duel_name() { # $1=pid -> best-effort scenario name from the command line
+  # ollama_duel.py takes the scenario JSON path as its first positional arg,
+  # e.g. "python3 ollama_duel.py scenarios/mac_roast_battle.json --turns 8".
+  local cmdline cfg name
+  cmdline=$(ps -o args= -p "$1" 2>/dev/null || true)
+  cfg=$(printf '%s' "$cmdline" | sed -E 's/.*ollama_duel\.py[[:space:]]+([^[:space:]]+).*/\1/')
+  if [ "$cfg" != "$cmdline" ] && [ -n "$cfg" ]; then
+    name=$(basename "$cfg" .json | tr ' ' '_')
+  else
+    name="pid-$1"
+  fi
+  printf '%s' "$name"
+}
+
+track_duels() { # $1=pids (space-separated, may be empty); alerts on start/end
+  local p cur="" prev pair entry started="" ended=""
+  for p in $1; do
+    cur+="$p:$(duel_name "$p") "
+  done
+  cur=$(printf '%s' "$cur" | tr -s ' ' | sed -e 's/^ *//' -e 's/ *$//')
+  prev=$(state_get duel_pids); prev=${prev:-}
+  [ "$cur" = "$prev" ] && return 0
+  for pair in $cur; do
+    case " $prev " in *" $pair "*) ;; *) started+="$pair ";; esac
+  done
+  for pair in $prev; do
+    case " $cur " in *" $pair "*) ;; *) ended+="$pair ";; esac
+  done
+  for pair in $started; do
+    entry=${pair#*:}
+    notify 2 "fleet-watch duel started" "Duel started on $(hostname): $entry."
+    log "duel started: $entry"
+  done
+  for pair in $ended; do
+    entry=${pair#*:}
+    notify 2 "fleet-watch duel ended" "Duel ended on $(hostname): $entry."
+    log "duel ended: $entry"
+  done
+  state_set duel_pids "$cur"
+  REPORT+="[duels] tracked: ${cur:-none} (was: ${prev:-none})"$'\n'
+}
+
 check_duels() { # local box only
   local pids now mtime age_m maxcpu=0 p scpu spids log
   pids=$(pgrep -f "[o]llama_duel.py" || true)
+  track_duels "$pids"
   if [ -z "$pids" ]; then REPORT+="[duels] none running"$'\n'; return 0; fi
   now=$(date +%s)
   REPORT+="[duels] pids: $pids"$'\n'
