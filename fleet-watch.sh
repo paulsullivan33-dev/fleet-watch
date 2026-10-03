@@ -14,6 +14,11 @@
 #   5. Sends ntfy alerts ONLY on state changes (no repeat spam),
 #      plus a low-priority "recovered" note and a daily alive ping.
 #
+# Every run appends to ~/.fleet-watch/fleet-watch.log: the exact probe
+# commands issued, the full results, and the complete triage-model
+# response (rotated to the last $LOG_KEEP_LINES lines), so the log shows
+# what "normal" looks like.
+#
 # Needs: bash, ssh (passwordless to fleet), curl, python3, ollama.
 # Install: copy this + triage-prompt.txt + the right fleet-watch.conf
 #          to ~/fleet-watch/ on each box, chmod +x, test with DRY_RUN=1,
@@ -43,6 +48,8 @@ OOM_WINDOW_SEC=$(( OOM_WINDOW_HOURS * 3600 ))
 : "${STUCK_AFTER_MIN:=60}"
 : "${OLLAMA_HOST:=http://localhost:11434}"
 : "${DRY_RUN:=0}"
+# Lines of history kept in fleet-watch.log (oldest trimmed once per run).
+: "${LOG_KEEP_LINES:=50000}"
 # Hosts where Ollama is expected, space-separated as SSH understands them
 # ("localhost" means this box). Hosts NOT listed skip the Ollama API check
 # entirely: no ollama_down flag, no alert. Empty (default) keeps the old
@@ -62,6 +69,24 @@ exec 9>"$STATE_DIR/lock"
 flock -n 9 || { echo "fleet-watch: another run in progress, exiting"; exit 0; }
 
 log() { echo "$(date '+%F %T') $*" >> "$LOG_FILE"; }
+
+log_block() { # $1=tag; logs stdin as a delimited block
+  {
+    echo "===== $(date '+%F %T') [$1] begin ====="
+    cat
+    echo "===== $(date '+%F %T') [$1] end ====="
+  } >> "$LOG_FILE"
+}
+
+rotate_log() { # keep the log from growing without bound
+  [ -f "$LOG_FILE" ] || return 0
+  local lines
+  lines=$(wc -l < "$LOG_FILE")
+  if [ "$lines" -gt "$LOG_KEEP_LINES" ]; then
+    tail -n "$LOG_KEEP_LINES" "$LOG_FILE" > "$LOG_FILE.tmp" \
+      && mv "$LOG_FILE.tmp" "$LOG_FILE"
+  fi
+}
 
 state_get() { grep -E "^$1=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2-; }
 state_set() {
@@ -97,13 +122,16 @@ DEEP_DISK='echo "== du"; timeout 50 du -sh ~/.ollama/models ~/dual/logs 2>/dev/n
 
 run_probe() { # $1=host ("localhost" = local)
   if [ "$1" = "localhost" ]; then
+    log "probe -> localhost (bash -c PROBE)"
     bash -c "$PROBE" 2>&1
   else
+    log "probe -> $1 (ssh PROBE)"
     ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new "$1" "$PROBE" 2>&1
   fi
 }
 
 run_deep_disk() { # $1=host
+  log "deep-disk -> $1 (ssh DEEP_DISK)"
   if [ "$1" = "localhost" ]; then
     bash -c "$DEEP_DISK" 2>&1
   else
@@ -191,12 +219,14 @@ peer_check() {
      && [ -n "$rts" ]; then
     now=$(date +%s); age=$(( (now - rts) / 60 ))
     REPORT+="[peer $PEER_HOST] heartbeat age: ${age}m"$'\n'
+    log "peer $PEER_HOST: heartbeat age ${age}m"
     [ "$age" -gt $(( INTERVAL_MIN * 3 )) ] \
       && FLAGS+=("warn:peer_stale:$PEER_HOST heartbeat ${age}m old")
     state_set peer_fail_count 0
   else
     fails=$((fails + 1)); state_set peer_fail_count "$fails"
     REPORT+="[peer $PEER_HOST] heartbeat unreachable (consecutive fail $fails)"$'\n'
+    log "peer $PEER_HOST: heartbeat unreachable (consecutive fail $fails)"
     [ "$fails" -ge 2 ] && FLAGS+=("crit:peer_silent:$PEER_HOST silent for 2 consecutive checks")
   fi
 }
@@ -254,6 +284,12 @@ maybe_alert() { # $1=sev $2=reason $3=full text
 }
 
 # ---------------- main ----------------
+rotate_log
+log "run start (DRY_RUN=$DRY_RUN)"
+# The exact commands issued this run (PROBE/DEEP_DISK are constant, so log
+# their text once; per-host invocations are logged in run_probe/run_deep_disk).
+printf '%s\n' "$PROBE" | log_block "command PROBE"
+printf '%s\n' "$DEEP_DISK" | log_block "command DEEP_DISK"
 REPORT="# fleet-watch run $(date '+%F %T %Z')"$'\n'
 
 check_host "localhost" "self($(hostname))"
@@ -266,6 +302,8 @@ check_duels
 peer_check
 
 echo "$REPORT" > "$REPORT_FILE"
+# Full results in the log: this is the "what was checked" record.
+printf '%s\n' "$REPORT" | log_block "report"
 
 SEV=$(worst_sev)
 LAST=$(state_get last_verdict); LAST=${LAST:-OK}
@@ -291,7 +329,9 @@ else
   ANSWER=""
   if ! pgrep -f "[o]llama_duel.py" >/dev/null 2>&1 \
      || ollama ps 2>/dev/null | grep -q "$MODEL"; then
+    log "triage: calling $MODEL at $OLLAMA_HOST"
     ANSWER=$(call_model)
+    printf '%s\n' "$ANSWER" | log_block "triage response ($MODEL)"
   else
     log "triage model call skipped: duel active with another model loaded"
   fi
@@ -308,4 +348,5 @@ else
   log "$SEV: $REASON"
 fi
 
+log "run end: $SEV"
 date +%s > "$HEARTBEAT_FILE"
