@@ -117,7 +117,7 @@ FLAGS=()
 REPORT=""
 
 # One SSH call per host, parse locally.
-PROBE='echo "== uptime"; uptime; echo "== df"; df -Ph / /home 2>/dev/null | head -8; echo "== mem"; free -m | head -2; echo "== cores"; nproc; echo "== temp"; (vcgencmd measure_temp 2>/dev/null || awk "{print \$1/1000 \" C\"}" /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo n/a); echo "== oom"; up=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0); dmesg 2>/dev/null | grep -i "killed process" | awk -v up="$up" -v win='"$OOM_WINDOW_SEC"' -F"[][]" "{t=\$2+0; if (up-t<win) print}" | tail -3; echo "== ollama"; curl -s -m 5 http://localhost:11434/api/tags -o /dev/null -w "api_http=%{http_code}\n" || echo "api=down"'
+PROBE='echo "== uptime"; uptime; echo "== df"; df -Ph -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null; echo "== mem"; free -m | head -2; echo "== cores"; nproc; echo "== temp"; (vcgencmd measure_temp 2>/dev/null || awk "{print \$1/1000 \" C\"}" /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo n/a); echo "== oom"; up=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0); dmesg 2>/dev/null | grep -i "killed process" | awk -v up="$up" -v win='"$OOM_WINDOW_SEC"' -F"[][]" "{t=\$2+0; if (up-t<win) print}" | tail -3; echo "== ollama"; curl -s -m 5 http://localhost:11434/api/tags -o /dev/null -w "api_http=%{http_code}\n" || echo "api=down"'
 
 DEEP_DISK='echo "== du"; timeout 50 du -sh ~/.ollama/models ~/dual/logs 2>/dev/null; echo "== topdirs"; timeout 50 du -sh ~/* 2>/dev/null | sort -rh | head -6; echo "== journal"; journalctl --disk-usage 2>/dev/null | head -2; echo "== models"; timeout 20 ollama list 2>/dev/null | head -12'
 
