@@ -35,5 +35,13 @@ OOM_WINDOW_HOURS=24
 
 OLLAMA_HOST="http://localhost:11434"
 
+# Hosts where Ollama is expected, space-separated as SSH understands them
+# ("localhost" means this box). Hosts NOT listed skip the Ollama API check
+# entirely. EDIT: list your Ollama boxes, e.g.
+# OLLAMA_HOSTS="localhost paul@192.168.1.109"
+# Leave empty/unset to check Ollama on every host (old behavior, noisy if
+# a fleet box like a sim server never runs Ollama).
+#OLLAMA_HOSTS=""
+
 # Set to 1 for a test run: prints what WOULD be sent, sends nothing.
 DRY_RUN=0

@@ -43,6 +43,11 @@ OOM_WINDOW_SEC=$(( OOM_WINDOW_HOURS * 3600 ))
 : "${STUCK_AFTER_MIN:=60}"
 : "${OLLAMA_HOST:=http://localhost:11434}"
 : "${DRY_RUN:=0}"
+# Hosts where Ollama is expected, space-separated as SSH understands them
+# ("localhost" means this box). Hosts NOT listed skip the Ollama API check
+# entirely: no ollama_down flag, no alert. Empty (default) keeps the old
+# behavior of checking Ollama on every host.
+: "${OLLAMA_HOSTS:=}"
 
 STATE_DIR="$HOME/.fleet-watch"
 LOG_FILE="$STATE_DIR/fleet-watch.log"
@@ -118,6 +123,12 @@ disk_flags_for() { # $1=label $2=probe-output
   done < <(echo "$out" | awk '/^\/dev\// {u=$5; gsub(/%/,"",u); if (u+0>0) print u, $6}')
 }
 
+ollama_expected() { # $1=host as passed to check_host
+  # Empty OLLAMA_HOSTS keeps the legacy behavior: check every host.
+  [ -z "$OLLAMA_HOSTS" ] && return 0
+  case " $OLLAMA_HOSTS " in *" $1 "*) return 0;; *) return 1;; esac
+}
+
 check_host() { # $1=host $2=label
   local host=$1 label=$2 out rc=0
   out=$(run_probe "$host") || rc=$?
@@ -132,7 +143,11 @@ check_host() { # $1=host $2=label
     FLAGS+=("warn:oom:$label shows OOM-killed processes in dmesg (last ${OOM_WINDOW_HOURS}h)")
   fi
   if echo "$out" | grep -q "api=down"; then
-    FLAGS+=("warn:ollama_down:$label Ollama API not answering")
+    if ollama_expected "$host"; then
+      FLAGS+=("warn:ollama_down:$label Ollama API not answering")
+    else
+      REPORT+="(Ollama check skipped for $label: not in OLLAMA_HOSTS)"$'\n'
+    fi
   fi
   # Deep disk detail only when a threshold tripped (keeps clean runs fast).
   if echo "$out" | awk '/^\/dev\// {u=$5; gsub(/%/,"",u); if (u+0>=0) print u}' \
