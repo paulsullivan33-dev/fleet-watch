@@ -321,7 +321,7 @@ maybe_alert() { # $1=sev $2=reason $3=full text
   fi
   local pri=3 tags="warning"
   if [ "$sev" = "CRIT" ]; then pri=4; tags="rotating_light"; fi
-  notify "$pri" "fleet-watch $sev" "$full" "$tags"
+  notify "$pri" "fleet-watch $sev [$(hostname)]" "$full" "$tags"
   state_set last_alert_hash "$hash"
   state_set last_alert_time "$now"
   state_set last_verdict "$sev"
@@ -354,13 +354,13 @@ LAST=$(state_get last_verdict); LAST=${LAST:-OK}
 
 if [ "$SEV" = "OK" ]; then
   if [ "$LAST" != "OK" ]; then
-    notify 2 "fleet-watch recovered" "All checks clear again. Previous state: $LAST." "white_check_mark"
+    notify 2 "fleet-watch recovered [$(hostname)]" "All checks clear again. Previous state: $LAST." "white_check_mark"
     log "recovered (was $LAST)"
   fi
   # Daily alive ping so silence means "working", not "broken".
   now=$(date +%s); lp=$(state_get last_daily_ping); lp=${lp:-0}
   if [ $(( now - lp )) -gt 86400 ]; then
-    notify 1 "fleet-watch alive" "Daily check-in: all fleet checks clear." "zzz"
+    notify 1 "fleet-watch alive [$(hostname)]" "Daily check-in: all fleet checks clear." "zzz"
     state_set last_daily_ping "$now"
   fi
   state_set last_verdict "OK"
