@@ -152,6 +152,17 @@ disk_flags_for() { # $1=label $2=probe-output
   done < <(echo "$out" | awk '/^\/dev\// {u=$5; gsub(/%/,"",u); if (u+0>0) print u, $6}')
 }
 
+triage_host_line() { # $1=label $2=probe-output -> compact one-liner for the model
+  local label=$1 out=$2 up disk mem oll
+  up=$(printf '%s' "$out" | awk '/^== uptime$/{getline; print; exit}')
+  up=${up#* }  # strip leading clock time
+  disk=$(printf '%s' "$out" | awk '/^\/dev\// {u=$5; gsub(/%/,"",u); if (u+0>max+0) {max=u; mnt=$6}} END {if (max>0) print max"% ("mnt")"}')
+  mem=$(printf '%s' "$out" | awk '$1=="Mem:" {print $7"M avail"}')
+  oll=$(printf '%s' "$out" | grep -o 'api_http=[0-9]*\|api=down' | head -1)
+  printf -- '- %s: %s | worst disk: %s | mem: %s | ollama: %s' \
+    "$label" "${up:-n/a}" "${disk:-n/a}" "${mem:-n/a}" "${oll:-n/a}"
+}
+
 ollama_expected() { # $1=host as passed to check_host
   # Empty OLLAMA_HOSTS keeps the legacy behavior: check every host.
   [ -z "$OLLAMA_HOSTS" ] && return 0
@@ -159,14 +170,16 @@ ollama_expected() { # $1=host as passed to check_host
 }
 
 check_host() { # $1=host $2=label
-  local host=$1 label=$2 out rc=0
+  local host=$1 label=$2 out rc=0 detail
   out=$(run_probe "$host") || rc=$?
   if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
     REPORT+="[$label] UNREACHABLE"$'\n'
+    TRIAGE_SUMMARY+="- $label: UNREACHABLE via SSH"$'\n'
     FLAGS+=("crit:unreachable:$label did not answer SSH")
     return
   fi
   REPORT+="[$label]"$'\n'"$out"$'\n'
+  TRIAGE_SUMMARY+="$(triage_host_line "$label" "$out")"$'\n'
   disk_flags_for "$label" "$out"
   if echo "$out" | grep -qi "killed process"; then
     FLAGS+=("warn:oom:$label shows OOM-killed processes in dmesg (last ${OOM_WINDOW_HOURS}h)")
@@ -181,7 +194,9 @@ check_host() { # $1=host $2=label
   # Deep disk detail only when a threshold tripped (keeps clean runs fast).
   if echo "$out" | awk '/^\/dev\// {u=$5; gsub(/%/,"",u); if (u+0>=0) print u}' \
        | awk -v w="$DISK_WARN" '$1>=w{found=1} END{exit !found}'; then
-    REPORT+="[disk detail $label]"$'\n'"$(run_deep_disk "$host")"$'\n'
+    detail=$(run_deep_disk "$host")
+    REPORT+="[disk detail $label]"$'\n'"$detail"$'\n'
+    TRIAGE_DETAIL+="--- disk detail: $label"$'\n'"$detail"$'\n'
   fi
 }
 
@@ -275,15 +290,15 @@ peer_check() {
   fi
 }
 
-call_model() { # reads $REPORT_FILE, prints model response
-  python3 - "$PROMPT_FILE" "$REPORT_FILE" "$MODEL" "$OLLAMA_HOST" <<'PYEOF' 2>/dev/null
+call_model() { # reads $TRIAGE_FILE (compact), prints model response
+  python3 - "$PROMPT_FILE" "$TRIAGE_FILE" "$MODEL" "$OLLAMA_HOST" <<'PYEOF' 2>/dev/null
 import json, sys, urllib.request
 prompt_path, report_path, model, host = sys.argv[1:5]
 prompt = open(prompt_path).read()
 report = open(report_path).read()
 body = json.dumps({
     "model": model,
-    "prompt": prompt + "\n\n# CURRENT FLEET REPORT (times America/Chicago)\n" + report,
+    "prompt": prompt + "\n\n# CURRENT FLEET SUMMARY (times America/Chicago)\n" + report,
     "stream": False,
     "think": False,  # qwen3 thinking trace is pure overhead for a 2-sentence verdict; on slow ARM boxes it blows the 300s timeout
     "options": {"num_predict": 250},  # hard-cap output: 2 sentences + VERDICT + suggestions fits easily; stops rambling from eating the timeout
@@ -337,6 +352,11 @@ log "run start (DRY_RUN=$DRY_RUN)"
 printf '%s\n' "$PROBE" | log_block "command PROBE"
 printf '%s\n' "$DEEP_DISK" | log_block "command DEEP_DISK"
 REPORT="# fleet-watch run $(date '+%F %T %Z')"$'\n'
+# Compact triage input (built alongside REPORT): the full report is too many
+# tokens to prefill inside the 300s model timeout on ARM (~2.6 tok/s), so the
+# model gets flags + one-line host summaries + disk detail instead.
+TRIAGE_SUMMARY=""
+TRIAGE_DETAIL=""
 
 check_host "localhost" "self($(hostname))"
 for h in $FLEET_HOSTS; do
@@ -350,6 +370,22 @@ peer_check
 echo "$REPORT" > "$REPORT_FILE"
 # Full results in the log: this is the "what was checked" record.
 printf '%s\n' "$REPORT" | log_block "report"
+
+# Compact model input, written every run (cheap); the triage call below reads
+# it instead of the full report. Also logged so the record shows exactly what
+# the model saw.
+TRIAGE_FILE="$STATE_DIR/triage_input.txt"
+{
+  echo "# FLAGS (what fired this run)"
+  rule_verdict
+  echo "# HOST SUMMARIES (one line each)"
+  printf '%s' "$TRIAGE_SUMMARY"
+  if [ -n "$TRIAGE_DETAIL" ]; then
+    echo "# DISK DETAIL (only hosts that tripped a disk threshold)"
+    printf '%s' "$TRIAGE_DETAIL"
+  fi
+} > "$TRIAGE_FILE"
+printf '%s\n' "$(cat "$TRIAGE_FILE")" | log_block "triage input"
 
 SEV=$(worst_sev)
 LAST=$(state_get last_verdict); LAST=${LAST:-OK}
