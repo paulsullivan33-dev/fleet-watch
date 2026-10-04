@@ -131,12 +131,13 @@ run_probe() { # $1=host ("localhost" = local)
   fi
 }
 
-run_deep_disk() { # $1=host
+run_deep_disk() { # $1=host [$2=command override, defaults to $DEEP_DISK]
+  local cmd=${2:-$DEEP_DISK}
   log "deep-disk -> $1 (ssh DEEP_DISK)"
   if [ "$1" = "localhost" ]; then
-    bash -c "$DEEP_DISK" 2>&1
+    bash -c "$cmd" 2>&1
   else
-    ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" "$DEEP_DISK" 2>&1
+    ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" "$cmd" 2>&1
   fi
 }
 
@@ -170,7 +171,7 @@ ollama_expected() { # $1=host as passed to check_host
 }
 
 check_host() { # $1=host $2=label
-  local host=$1 label=$2 out rc=0 detail
+  local host=$1 label=$2 out rc=0 detail tripped deep_cmd mnt
   out=$(run_probe "$host") || rc=$?
   if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
     REPORT+="[$label] UNREACHABLE"$'\n'
@@ -192,9 +193,16 @@ check_host() { # $1=host $2=label
     fi
   fi
   # Deep disk detail only when a threshold tripped (keeps clean runs fast).
-  if echo "$out" | awk '/^\/dev\// {u=$5; gsub(/%/,"",u); if (u+0>=0) print u}' \
-       | awk -v w="$DISK_WARN" '$1>=w{found=1} END{exit !found}'; then
-    detail=$(run_deep_disk "$host")
+  # Target the tripped mount(s) specifically: the base probe only covers
+  # $HOME, so without this the model gets home-dir details for a warning
+  # about a different disk and writes about the wrong directories.
+  tripped=$(echo "$out" | awk -v w="$DISK_WARN" '/^\/dev\// {u=$5; gsub(/%/,"",u); if (u+0>=w) print $6}')
+  if [ -n "$tripped" ]; then
+    deep_cmd=$DEEP_DISK
+    for mnt in $tripped; do
+      deep_cmd="$deep_cmd; echo \"== topdirs $mnt\"; timeout 60 du -sh \"$mnt\"/* 2>/dev/null | sort -rh | head -8"
+    done
+    detail=$(run_deep_disk "$host" "$deep_cmd")
     REPORT+="[disk detail $label]"$'\n'"$detail"$'\n'
     TRIAGE_DETAIL+="--- disk detail: $label"$'\n'"$detail"$'\n'
   fi
