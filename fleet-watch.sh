@@ -286,6 +286,7 @@ body = json.dumps({
     "prompt": prompt + "\n\n# CURRENT FLEET REPORT (times America/Chicago)\n" + report,
     "stream": False,
     "think": False,  # qwen3 thinking trace is pure overhead for a 2-sentence verdict; on slow ARM boxes it blows the 300s timeout
+    "options": {"num_predict": 250},  # hard-cap output: 2 sentences + VERDICT + suggestions fits easily; stops rambling from eating the timeout
 }).encode()
 req = urllib.request.Request(host + "/api/generate", data=body,
                              headers={"Content-Type": "application/json"})
