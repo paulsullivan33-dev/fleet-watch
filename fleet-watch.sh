@@ -334,9 +334,13 @@ rule_verdict() { # fallback when the model is unavailable
   for f in "${FLAGS[@]}"; do rest=${f#*:}; echo "- $rest"; done
 }
 
-maybe_alert() { # $1=sev $2=reason $3=full text
-  local sev=$1 reason=$2 full=$3 hash now last_hash last_time
-  hash=$(printf '%s' "$sev|$reason" | md5sum | cut -d' ' -f1)
+maybe_alert() { # $1=sev $2=reason $3=full text [$4=dedup key]
+  # Dedup key defaults to sev|reason, but callers with non-deterministic
+  # reason text (model verdicts) must pass the rule flags instead --
+  # otherwise every run hashes differently and the <6h suppression
+  # never fires.
+  local sev=$1 reason=$2 full=$3 key=${4:-$sev|$reason} hash now last_hash last_time
+  hash=$(printf '%s' "$key" | md5sum | cut -d' ' -f1)
   now=$(date +%s)
   last_hash=$(state_get last_alert_hash); last_hash=${last_hash:-none}
   last_time=$(state_get last_alert_time); last_time=${last_time:-0}
@@ -434,7 +438,8 @@ else
     FULL="fleet-watch triage ($SEV):"$'\n'"$ANSWER"
   fi
   REASON=$(echo "$VERDICT" | sed -E 's/^VERDICT:[[:space:]]*//I' | cut -c1-160)
-  maybe_alert "$SEV" "$REASON" "$FULL"
+  # Dedup on the rule flags (deterministic), not the model prose.
+  maybe_alert "$SEV" "$REASON" "$FULL" "$SEV|$(rule_verdict | tr '\n' ';')"
   log "$SEV: $REASON"
 fi
 
