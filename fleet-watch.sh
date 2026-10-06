@@ -7,8 +7,10 @@
 #   1. Checks local health + fleet health over SSH (load, disk, mem,
 #      OOM kills, Ollama API, temperature).
 #   2. Watches duels: alerts when a duel starts/ends (with the scenario
-#      name), and flags stuck duels: duel process alive + run_results.log
-#      not growing + llama-server pegged = stuck.
+#      name), and flags stuck duels: duel process alive + no duel output
+#      (freshest of run_results.log and the per-duel logs/*.log transcripts,
+#      since run_results.log only updates when a duel completes) for
+#      STUCK_AFTER_MIN minutes + llama-server pegged = stuck.
 #   3. Checks the peer monitor's heartbeat (Q watches Pi, Pi watches Q).
 #   4. If anything looks off, asks the local small model to triage and
 #      explain; otherwise stays quiet (no model call on clean runs).
@@ -251,14 +253,14 @@ track_duels() { # $1=pids (space-separated, may be empty); alerts on start/end
 }
 
 check_duels() { # local box only
-  local pids now mtime age_m maxcpu=0 p scpu spids log
+  local pids now mtime age_m maxcpu=0 p scpu spids log newest newest_mtime newest_age_m
   pids=$(pgrep -f "[o]llama_duel.py" || true)
   track_duels "$pids"
   if [ -z "$pids" ]; then REPORT+="[duels] none running"$'\n'; return 0; fi
   now=$(date +%s)
   REPORT+="[duels] pids: $pids"$'\n'
   log="$DUEL_DIR/run_results.log"
-  age_m=0
+  age_m=
   if [ -f "$log" ]; then
     mtime=$(stat -c %Y "$log")
     age_m=$(( (now - mtime) / 60 ))
@@ -266,6 +268,22 @@ check_duels() { # local box only
   else
     REPORT+="[duels] no run_results.log in $DUEL_DIR"$'\n'
   fi
+  # Per-duel transcripts (logs/*.log) grow while a duel is working, but
+  # run_results.log only updates when a duel completes — so a long duel
+  # looked "stuck" even while generating. Use the freshest of the two as
+  # the liveness signal, falling back to run_results.log alone.
+  if [ -d "$DUEL_DIR/logs" ]; then
+    newest=$(ls -t "$DUEL_DIR"/logs/*.log 2>/dev/null | head -n 1)
+    if [ -n "$newest" ]; then
+      newest_mtime=$(stat -c %Y "$newest")
+      newest_age_m=$(( (now - newest_mtime) / 60 ))
+      REPORT+="[duels] newest transcript: $(basename "$newest") (${newest_age_m}m old)"$'\n'
+      if [ -z "${age_m:-}" ] || [ "$newest_age_m" -lt "$age_m" ]; then
+        age_m=$newest_age_m
+      fi
+    fi
+  fi
+  age_m=${age_m:-0}
   spids=$(pgrep -f "[l]lama-server" || true)
   for p in $spids; do
     scpu=$(ps -o %cpu= -p "$p" 2>/dev/null | awk '{print int($1+0)}')
@@ -273,9 +291,9 @@ check_duels() { # local box only
   done
   REPORT+="[duels] llama-server max cpu: ${maxcpu}%"$'\n'
   if [ "$age_m" -gt "$STUCK_AFTER_MIN" ] && [ "$maxcpu" -gt 70 ]; then
-    FLAGS+=("crit:duel_stuck:run_results.log ${age_m}m old while llama-server pegged at ${maxcpu}% (pids $pids)")
+    FLAGS+=("crit:duel_stuck:no duel output for ${age_m}m while llama-server pegged at ${maxcpu}% (pids $pids)")
   elif [ "$age_m" -gt "$STUCK_AFTER_MIN" ]; then
-    FLAGS+=("warn:duel_idle:run_results.log ${age_m}m old, llama-server idle (probably loading next model)")
+    FLAGS+=("warn:duel_idle:no duel output for ${age_m}m, llama-server idle (probably loading next model)")
   fi
 }
 
