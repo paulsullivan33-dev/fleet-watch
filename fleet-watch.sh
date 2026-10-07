@@ -268,12 +268,12 @@ check_duels() { # local box only
   else
     REPORT+="[duels] no run_results.log in $DUEL_DIR"$'\n'
   fi
-  # Per-duel transcripts (logs/*.log) grow while a duel is working, but
+  # Per-duel transcripts (output/logs/*.log) grow while a duel is working, but
   # run_results.log only updates when a duel completes — so a long duel
   # looked "stuck" even while generating. Use the freshest of the two as
   # the liveness signal, falling back to run_results.log alone.
-  if [ -d "$DUEL_DIR/logs" ]; then
-    newest=$(ls -t "$DUEL_DIR"/logs/*.log 2>/dev/null | head -n 1)
+  if [ -d "$DUEL_DIR/output/logs" ]; then
+    newest=$(ls -t "$DUEL_DIR"/output/logs/*.log 2>/dev/null | head -n 1)
     if [ -n "$newest" ]; then
       newest_mtime=$(stat -c %Y "$newest")
       newest_age_m=$(( (now - newest_mtime) / 60 ))
