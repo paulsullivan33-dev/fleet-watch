@@ -240,12 +240,12 @@ track_duels() { # $1=pids (space-separated, may be empty); alerts on start/end
   done
   for pair in $started; do
     entry=${pair#*:}
-    notify 2 "fleet-watch duel started" "Duel started on $(hostname): $entry."
+    notify 2 "fleet-watch duel started [$(hostname)]" "Duel started on $(hostname): $entry."
     log "duel started: $entry"
   done
   for pair in $ended; do
     entry=${pair#*:}
-    notify 2 "fleet-watch duel ended" "Duel ended on $(hostname): $entry."
+    notify 2 "fleet-watch duel ended [$(hostname)]" "Duel ended on $(hostname): $entry."
     log "duel ended: $entry"
   done
   state_set duel_pids "$cur"
