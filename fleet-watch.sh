@@ -358,6 +358,12 @@ maybe_alert() { # $1=sev $2=reason $3=full text [$4=dedup key]
   # otherwise every run hashes differently and the <6h suppression
   # never fires.
   local sev=$1 reason=$2 full=$3 key=${4:-$sev|$reason} hash now last_hash last_time
+  # Normalize volatile measurements out of the dedup key before hashing:
+  # ages ("5161m"), percentages ("at 86%", "pegged at 366%") and pid lists
+  # change every run, so without this the <6h suppression never fires and
+  # a persistent condition pages every 10 minutes. Severity transitions
+  # (warn->crit) still hash differently and alert immediately.
+  key=$(printf '%s' "$key" | sed -E 's/[0-9]+m( old)?//g; s/(at|pegged at) [0-9]+%//g; s/\(pids [0-9 ]+\)//g')
   hash=$(printf '%s' "$key" | md5sum | cut -d' ' -f1)
   now=$(date +%s)
   last_hash=$(state_get last_alert_hash); last_hash=${last_hash:-none}
