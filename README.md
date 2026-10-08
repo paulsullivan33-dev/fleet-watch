@@ -10,17 +10,22 @@ something needs attention.
 Every run (cron, every 10 minutes):
 
 1. **Health checks** over passwordless SSH: reachability, load vs cores,
-   disk, memory, OOM kills from the last 24h (`OOM_WINDOW_HOURS`),
-   Ollama API, temperature.
-2. **Stuck-job detection**: a duel/inference process alive plus its progress
-   log not growing plus the inference server pegged = stuck (CRIT).
-   A stale log with an idle server = probably loading the next model (WARN).
+   disk and inode usage, memory, OOM kills from the last 24h
+   (`OOM_WINDOW_HOURS`), Ollama API, temperature, failed systemd
+   services, pending-reboot flag, SMART disk health (best-effort).
+2. **Stuck-job detection**: a duel/inference process alive plus its newest
+   per-duel transcript not growing plus the inference server pegged =
+   stuck (CRIT). A stale log with an idle server = probably loading the
+   next model (WARN).
 3. **Peer heartbeat**: each monitor checks the other's heartbeat timestamp.
    Two consecutive failures = the peer is silent (CRIT) — so if one box
    dies, the other tells you.
-4. **Small-model triage, only when something looks off**: clean runs skip
-   the model call entirely. When a check trips, the local small model
-   (1.7B-class is fine) explains the problem in plain language.
+4. **Model triage, only when something looks off**: clean runs skip the
+   model call entirely. When a check trips, a model on the always-on AI
+   box (see Remote triage below) explains the problem in plain language
+   and suggests a fix. If the triage endpoint is unreachable, the alert
+   goes out with the rule-based findings instead — plus a WARN that the
+   triage brain is offline.
 5. **Disk advisor**: when a mount crosses the warn/crit threshold, the
    triage names what's eating the space (model blobs, logs, journals)
    and suggests concrete cleanup commands, cheapest first.
@@ -29,14 +34,36 @@ Every run (cron, every 10 minutes):
 
 The health checks and heartbeats are plain SSH — no impact on running
 duels. The triage model call only fires when something already looks
-wrong, and it reuses the already-loaded model when it can. If a duel is
-mid-turn with a *different* model in memory, the triage call is skipped
-entirely (loading two models at once OOM-killed small boxes before) and
+wrong. When triage runs on a remote box (`OLLAMA_HOST` pointing
+elsewhere), nothing loads locally at all, so duels are completely
+unaffected. With local triage the old OOM guard still applies: if a duel
+is mid-turn with a *different* model in memory, the triage call is
+skipped (loading two models at once OOM-killed small boxes before) and
 the alert goes out with the rule-based findings instead.
+
+## Remote triage
+
+By default the triage model runs on the monitor itself (`OLLAMA_HOST`
+defaults to `http://localhost:11434`). Point it at a bigger always-on
+box for better verdicts and zero local memory pressure:
+
+```bash
+OLLAMA_HOST="http://192.168.1.236:11434"
+MODEL="qwen3.5:4b"
+```
+
+The target's Ollama must listen on the LAN (`OLLAMA_HOST=0.0.0.0` in
+its systemd environment — note: Ollama has no auth, so keep this
+LAN-only). The monitor probes the endpoint every run and raises a WARN
+if it's unreachable; triage then falls back to the rule-based verdicts.
 
 ## Alert discipline
 - Alerts fire **only on state changes** — no repeat spam for the same
-  ongoing issue (one reminder if it's still broken after 6h).
+  ongoing issue (one reminder if it's still broken after 6h). Volatile
+  measurements (ages, percentages, PID lists) are normalized out of the
+  dedup hash so steady states stay quiet.
+- All notification titles carry the sender hostname (`[name]`), so you
+  can tell which monitor is talking at a glance.
 - A "recovered" note goes out when things clear, so silence stays trustworthy.
 - A low-priority daily "alive" ping proves the monitor itself is working.
 - ntfy priorities: 3 = warning, 4 = critical, 2 = recovered, 1 = daily ping.
@@ -47,9 +74,9 @@ the alert goes out with the rule-based findings instead.
   `ssh`, `curl`, `python3`, `ollama`)
 - `triage-prompt.txt` — baselines, few-shot examples, and output format
   for the triage model
-- `fleet-watch.conf.q` / `fleet-watch.conf.pi` — per-box configs; copy the
-  right one to `fleet-watch.conf` and edit the marked lines (peer host,
-  fleet hosts, ntfy topic URL)
+- `fleet-watch.conf.q` / `fleet-watch.conf.pi` — per-box config templates;
+  copy the right one to `fleet-watch.conf` and edit the marked lines (peer
+  host, fleet hosts, ntfy topic URL, `OLLAMA_HOST`/`MODEL` for remote triage)
 
 ## Install
 
