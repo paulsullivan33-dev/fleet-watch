@@ -119,7 +119,7 @@ FLAGS=()
 REPORT=""
 
 # One SSH call per host, parse locally.
-PROBE='echo "== uptime"; uptime; echo "== df"; df -Ph -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null; echo "== mem"; free -m | head -2; echo "== cores"; nproc; echo "== temp"; (vcgencmd measure_temp 2>/dev/null || awk "{print \$1/1000 \" C\"}" /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo n/a); echo "== oom"; up=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0); dmesg 2>/dev/null | grep -i "killed process" | awk -v up="$up" -v win='"$OOM_WINDOW_SEC"' -F"[][]" "{t=\$2+0; if (up-t<win) print}" | tail -3; echo "== ollama"; curl -s -m 5 http://localhost:11434/api/tags -o /dev/null -w "api_http=%{http_code}\n" || echo "api=down"'
+PROBE='echo "== uptime"; uptime; echo "== df"; df -Ph -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null; echo "== mem"; free -m | head -2; echo "== cores"; nproc; echo "== temp"; (vcgencmd measure_temp 2>/dev/null || awk "{print \$1/1000 \" C\"}" /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo n/a); echo "== oom"; up=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0); dmesg 2>/dev/null | grep -i "killed process" | awk -v up="$up" -v win='"$OOM_WINDOW_SEC"' -F"[][]" "{t=\$2+0; if (up-t<win) print}" | tail -3; echo "== ollama"; curl -s -m 5 http://localhost:11434/api/tags -o /dev/null -w "api_http=%{http_code}\n" || echo "api=down"; echo "== failedsvc"; systemctl --failed --no-legend 2>/dev/null | wc -l; echo "== rebootreq"; [ -f /var/run/reboot-required ] && echo yes || echo no; echo "== inodes"; df -iP / 2>/dev/null | tail -1 | tr -s " " | cut -d" " -f5 | tr -cd "0-9"; echo "== smart"; for d in /dev/sda /dev/sdb /dev/nvme0n1 /dev/mmcblk0; do [ -b "$d" ] || continue; r=$(sudo -n smartctl -H "$d" 2>/dev/null || smartctl -H "$d" 2>/dev/null) || continue; w=$(echo "$r" | grep -oiE "passed|failed" | head -1); [ -n "$w" ] && echo "$d: $w"; done; echo "== end"'
 
 DEEP_DISK='echo "== du"; timeout 50 du -sh ~/.ollama/models ~/dual/logs 2>/dev/null; echo "== topdirs"; timeout 50 du -sh ~/* 2>/dev/null | sort -rh | head -6; echo "== journal"; journalctl --disk-usage 2>/dev/null | head -2; echo "== models"; timeout 20 ollama list 2>/dev/null | head -12'
 
@@ -156,14 +156,19 @@ disk_flags_for() { # $1=label $2=probe-output
 }
 
 triage_host_line() { # $1=label $2=probe-output -> compact one-liner for the model
-  local label=$1 out=$2 up disk mem oll
+  local label=$1 out=$2 up disk mem oll fsvc rr extra=""
   up=$(printf '%s' "$out" | awk '/^== uptime$/{getline; print; exit}')
   up=${up#* }  # strip leading clock time
   disk=$(printf '%s' "$out" | awk '/^\/dev\// {u=$5; gsub(/%/,"",u); if (u+0>max+0) {max=u; mnt=$6}} END {if (max>0) print max"% ("mnt")"}')
   mem=$(printf '%s' "$out" | awk '$1=="Mem:" {print $7"M avail"}')
   oll=$(printf '%s' "$out" | grep -o 'api_http=[0-9]*\|api=down' | head -1)
-  printf -- '- %s: %s | worst disk: %s | mem: %s | ollama: %s' \
-    "$label" "${up:-n/a}" "${disk:-n/a}" "${mem:-n/a}" "${oll:-n/a}"
+  # Extra fragments only when something fired: quiet hosts stay one line.
+  fsvc=$(printf '%s' "$out" | grep -A1 "^== failedsvc$" | tail -1)
+  [ "${fsvc:-0}" -gt 0 ] 2>/dev/null && extra+=" | failed_svc:$fsvc"
+  rr=$(printf '%s' "$out" | grep -A1 "^== rebootreq$" | tail -1)
+  [ "$rr" = "yes" ] && extra+=" | reboot-required"
+  printf -- '- %s: %s | worst disk: %s | mem: %s | ollama: %s%s' \
+    "$label" "${up:-n/a}" "${disk:-n/a}" "${mem:-n/a}" "${oll:-n/a}" "$extra"
 }
 
 ollama_expected() { # $1=host as passed to check_host
@@ -193,6 +198,25 @@ check_host() { # $1=host $2=label
     else
       REPORT+="(Ollama check skipped for $label: not in OLLAMA_HOSTS)"$'\n'
     fi
+  fi
+  # New health checks: failed services, pending reboot, inode exhaustion,
+  # SMART disk health. All best-effort; missing sections parse as clean.
+  fsvc=$(echo "$out" | grep -A1 "^== failedsvc$" | tail -1)
+  if [ "${fsvc:-0}" -gt 0 ] 2>/dev/null; then
+    FLAGS+=("warn:failedsvc:$label has $fsvc failed systemd service(s)")
+  fi
+  if echo "$out" | grep -A1 "^== rebootreq$" | tail -1 | grep -q "^yes$"; then
+    FLAGS+=("warn:reboot_required:$label has a pending reboot")
+  fi
+  inodes=$(echo "$out" | grep -A1 "^== inodes$" | tail -1)
+  if [ "${inodes:-0}" -ge "$DISK_CRIT" ] 2>/dev/null; then
+    FLAGS+=("crit:inodes:$label / at ${inodes}% inodes used")
+  elif [ "${inodes:-0}" -ge "$DISK_WARN" ] 2>/dev/null; then
+    FLAGS+=("warn:inodes:$label / at ${inodes}% inodes used")
+  fi
+  smart_bad=$(echo "$out" | awk '/^== smart$/{f=1;next} /^== /{f=0} f' | grep -i "failed")
+  if [ -n "$smart_bad" ]; then
+    FLAGS+=("warn:smart:$label disk health FAILED: $(echo "$smart_bad" | tr '\n' ';')")
   fi
   # Deep disk detail only when a threshold tripped (keeps clean runs fast).
   # Target the tripped mount(s) specifically: the base probe only covers
@@ -317,7 +341,7 @@ peer_check() {
 }
 
 call_model() { # reads $TRIAGE_FILE (compact), prints model response
-  python3 - "$PROMPT_FILE" "$TRIAGE_FILE" "$MODEL" "$OLLAMA_HOST" <<'PYEOF' 2>/dev/null
+  python3 - "$PROMPT_FILE" "$TRIAGE_FILE" "$MODEL" "$OLLAMA_HOST" <<'PYEOF' 2>"$STATE_DIR/triage_err.txt"
 import json, sys, urllib.request
 prompt_path, report_path, model, host = sys.argv[1:5]
 prompt = open(prompt_path).read()
@@ -423,6 +447,12 @@ TRIAGE_FILE="$STATE_DIR/triage_input.txt"
 } > "$TRIAGE_FILE"
 printf '%s\n' "$(cat "$TRIAGE_FILE")" | log_block "triage input"
 
+# The triage model lives at OLLAMA_HOST now; if it's unreachable the model
+# call below degrades silently to rule-based verdicts, so flag it explicitly.
+if ! curl -s -m 10 "$OLLAMA_HOST/api/tags" -o /dev/null; then
+  FLAGS+=("warn:triage_endpoint:OLLAMA_HOST $OLLAMA_HOST not answering — triage degraded to rule-based")
+fi
+
 SEV=$(worst_sev)
 LAST=$(state_get last_verdict); LAST=${LAST:-OK}
 
@@ -458,6 +488,9 @@ else
     log "triage: calling $MODEL at $OLLAMA_HOST"
     ANSWER=$(call_model)
     printf '%s\n' "$ANSWER" | log_block "triage response ($MODEL)"
+    if [ -z "$ANSWER" ]; then
+      log "triage call failed: $(head -c 300 "$STATE_DIR/triage_err.txt" 2>/dev/null | tr '\n' ' ')"
+    fi
   else
     log "triage model call skipped: duel active with another model loaded"
   fi
