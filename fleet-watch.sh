@@ -440,12 +440,20 @@ if [ "$SEV" = "OK" ]; then
   state_set last_verdict "OK"
   log "OK"
 else
-  # OOM safety: if a duel is mid-turn with a *different* model loaded,
-  # don't ask Ollama to load the triage model too — two 1.7B models in
-  # memory OOM-killed these boxes before. Fall back to the rule-based
-  # verdict instead (the VERDICT parse below handles the empty answer).
+  # OOM safety (local triage only): if a duel is mid-turn with a *different*
+  # model loaded, don't ask Ollama to load the triage model too — two 1.7B
+  # models in memory OOM-killed these boxes before. With a remote OLLAMA_HOST
+  # the triage model never loads locally, so the guard is skipped and triage
+  # always runs. Fall back to the rule-based verdict instead (the VERDICT
+  # parse below handles the empty answer).
   ANSWER=""
-  if ! pgrep -f "[o]llama_duel.py" >/dev/null 2>&1 \
+  case "$OLLAMA_HOST" in
+    http://localhost*|http://127.*|https://localhost*|https://127.*)
+      LOCAL_TRIAGE=1 ;;
+    *) LOCAL_TRIAGE=0 ;;
+  esac
+  if [ "$LOCAL_TRIAGE" -eq 0 ] \
+     || ! pgrep -f "[o]llama_duel.py" >/dev/null 2>&1 \
      || ollama ps 2>/dev/null | grep -q "$MODEL"; then
     log "triage: calling $MODEL at $OLLAMA_HOST"
     ANSWER=$(call_model)
