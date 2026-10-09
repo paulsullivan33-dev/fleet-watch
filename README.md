@@ -11,8 +11,10 @@ Every run (cron, every 10 minutes):
 
 1. **Health checks** over passwordless SSH: reachability, load vs cores,
    disk and inode usage, memory, OOM kills from the last 24h
-   (`OOM_WINDOW_HOURS`), Ollama API, temperature, failed systemd
-   services, pending-reboot flag, SMART disk health (best-effort).
+   (`OOM_WINDOW_HOURS`), Ollama API, temperature (warn at `TEMP_WARN`,
+   default 80C), failed systemd services, pending-reboot flag, SMART
+   disk health (best-effort), read-only remounts, disk/filesystem errors
+   in dmesg, and NTP clock sync.
 2. **Stuck-job detection**: a duel/inference process alive plus its newest
    per-duel transcript not growing plus the inference server pegged =
    stuck (CRIT). A stale log with an idle server = probably loading the

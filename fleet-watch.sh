@@ -44,6 +44,7 @@ source "$CONF"
 : "${INTERVAL_MIN:=10}"
 : "${DISK_WARN:=85}"
 : "${DISK_CRIT:=95}"
+: "${TEMP_WARN:=80}"  # CPU temp in Celsius; warn at or above
 # Only OOM kills newer than this (hours) raise a flag. dmesg keeps old
 # entries indefinitely, so without a window one past event nags forever.
 : "${OOM_WINDOW_HOURS:=24}"
@@ -119,7 +120,7 @@ FLAGS=()
 REPORT=""
 
 # One SSH call per host, parse locally.
-PROBE='echo "== uptime"; uptime; echo "== df"; df -Ph -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null; echo "== mem"; free -m | head -2; echo "== cores"; nproc; echo "== temp"; (vcgencmd measure_temp 2>/dev/null || awk "{print \$1/1000 \" C\"}" /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo n/a); echo "== oom"; up=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0); dmesg 2>/dev/null | grep -i "killed process" | awk -v up="$up" -v win='"$OOM_WINDOW_SEC"' -F"[][]" "{t=\$2+0; if (up-t<win) print}" | tail -3; echo "== ollama"; curl -s -m 5 http://localhost:11434/api/tags -o /dev/null -w "api_http=%{http_code}\n" || echo "api=down"; echo "== failedsvc"; systemctl --failed --no-legend 2>/dev/null | head -20; echo "== rebootreq"; [ -f /var/run/reboot-required ] && echo yes || echo no; echo "== inodes"; df -iP / 2>/dev/null | tail -1 | tr -s " " | cut -d" " -f5 | tr -cd "0-9"; echo "== smart"; for d in /dev/sda /dev/sdb /dev/nvme0n1 /dev/mmcblk0; do [ -b "$d" ] || continue; r=$(sudo -n smartctl -H "$d" 2>/dev/null || smartctl -H "$d" 2>/dev/null) || continue; w=$(echo "$r" | grep -oiE "passed|failed" | head -1); [ -n "$w" ] && echo "$d: $w"; done; echo "== end"'
+PROBE='echo "== uptime"; uptime; echo "== df"; df -Ph -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null; echo "== mem"; free -m | head -2; echo "== cores"; nproc; echo "== temp"; (vcgencmd measure_temp 2>/dev/null || awk "{print \$1/1000 \" C\"}" /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo n/a); echo "== oom"; up=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0); dmesg 2>/dev/null | grep -i "killed process" | awk -v up="$up" -v win='"$OOM_WINDOW_SEC"' -F"[][]" "{t=\$2+0; if (up-t<win) print}" | tail -3; echo "== ollama"; curl -s -m 5 http://localhost:11434/api/tags -o /dev/null -w "api_http=%{http_code}\n" || echo "api=down"; echo "== failedsvc"; systemctl --failed --no-legend 2>/dev/null | head -20; echo "== rebootreq"; [ -f /var/run/reboot-required ] && echo yes || echo no; echo "== inodes"; df -iP / 2>/dev/null | tail -1 | tr -s " " | cut -d" " -f5 | tr -cd "0-9"; echo "== smart"; for d in /dev/sda /dev/sdb /dev/nvme0n1 /dev/mmcblk0; do [ -b "$d" ] || continue; r=$(sudo -n smartctl -H "$d" 2>/dev/null || smartctl -H "$d" 2>/dev/null) || continue; w=$(echo "$r" | grep -oiE "passed|failed" | head -1); [ -n "$w" ] && echo "$d: $w"; done; echo "== ro"; grep -E " (ext4|xfs|btrfs) " /proc/mounts 2>/dev/null | cut -d" " -f2,4 | grep -E "[ ,]ro(,|$)" | cut -d" " -f1 | head -5; echo "== dmesg"; dmesg 2>/dev/null | grep -iE "I/O error|EXT4-fs error|Buffer I/O error|scsi error" | tail -5; echo "== clock"; timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown; echo "== end"'
 
 DEEP_DISK='echo "== du"; timeout 50 du -sh ~/.ollama/models ~/dual/logs 2>/dev/null; echo "== topdirs"; timeout 50 du -sh ~/* 2>/dev/null | sort -rh | head -6; echo "== journal"; journalctl --disk-usage 2>/dev/null | head -2; echo "== models"; timeout 20 ollama list 2>/dev/null | head -12'
 
@@ -175,6 +176,13 @@ triage_host_line() { # $1=label $2=probe-output -> compact one-liner for the mod
   [ "${fsvc_n:-0}" -gt 0 ] 2>/dev/null && extra+=" | failed_svc:$fsvc_n($fsvc_names)"
   rr=$(printf '%s' "$out" | grep -A1 "^== rebootreq$" | tail -1)
   [ "$rr" = "yes" ] && extra+=" | reboot-required"
+  ro_m=$(printf '%s' "$out" | awk '/^== ro$/{f=1;next} /^== /{f=0} f' | head -5 | paste -sd, -)
+  [ -n "$ro_m" ] && extra+=" | readonly:$ro_m"
+  dm_n=$(printf '%s' "$out" | awk '/^== dmesg$/{f=1;next} /^== /{f=0} f' | grep -c .)
+  [ "$dm_n" -gt 0 ] 2>/dev/null && extra+=" | dmesg_err:$dm_n"
+  [ "$(printf '%s' "$out" | grep -A1 "^== clock$" | tail -1)" = "no" ] && extra+=" | clock:unsynced"
+  tp_c=$(printf '%s' "$out" | grep -A1 "^== temp$" | tail -1 | grep -oE "[0-9]+(\.[0-9]+)?" | head -1)
+  { [ -n "$tp_c" ] && [ "${tp_c%.*}" -ge "$TEMP_WARN" ] 2>/dev/null && extra+=" | temp:${tp_c}C"; } 2>/dev/null
   printf -- '- %s: %s | worst disk: %s | mem: %s | ollama: %s%s' \
     "$label" "${up:-n/a}" "${disk:-n/a}" "${mem:-n/a}" "${oll:-n/a}" "$extra"
 }
@@ -225,6 +233,21 @@ check_host() { # $1=host $2=label
   smart_bad=$(echo "$out" | awk '/^== smart$/{f=1;next} /^== /{f=0} f' | grep -i "failed")
   if [ -n "$smart_bad" ]; then
     FLAGS+=("warn:smart:$label disk health FAILED: $(echo "$smart_bad" | tr '\n' ';')")
+  fi
+  ro_mounts=$(echo "$out" | awk '/^== ro$/{f=1;next} /^== /{f=0} f' | head -5 | paste -sd, -)
+  if [ -n "$ro_mounts" ]; then
+    FLAGS+=("warn:readonly:$label read-only mount(s): $ro_mounts")
+  fi
+  dmesg_err=$(echo "$out" | awk '/^== dmesg$/{f=1;next} /^== /{f=0} f' | grep -c .)
+  if [ "$dmesg_err" -gt 0 ] 2>/dev/null; then
+    FLAGS+=("warn:dmesg:$label $dmesg_err disk/filesystem error(s) in dmesg")
+  fi
+  if [ "$(echo "$out" | grep -A1 "^== clock$" | tail -1)" = "no" ]; then
+    FLAGS+=("warn:clock:$label system clock not NTP-synchronized")
+  fi
+  temp_c=$(echo "$out" | grep -A1 "^== temp$" | tail -1 | grep -oE "[0-9]+(\.[0-9]+)?" | head -1)
+  if [ -n "$temp_c" ] && [ "${temp_c%.*}" -ge "$TEMP_WARN" ] 2>/dev/null; then
+    FLAGS+=("warn:temp:$label CPU temp at or above ${TEMP_WARN}C")
   fi
   # Deep disk detail only when a threshold tripped (keeps clean runs fast).
   # Target the tripped mount(s) specifically: the base probe only covers
