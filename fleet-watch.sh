@@ -119,7 +119,7 @@ FLAGS=()
 REPORT=""
 
 # One SSH call per host, parse locally.
-PROBE='echo "== uptime"; uptime; echo "== df"; df -Ph -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null; echo "== mem"; free -m | head -2; echo "== cores"; nproc; echo "== temp"; (vcgencmd measure_temp 2>/dev/null || awk "{print \$1/1000 \" C\"}" /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo n/a); echo "== oom"; up=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0); dmesg 2>/dev/null | grep -i "killed process" | awk -v up="$up" -v win='"$OOM_WINDOW_SEC"' -F"[][]" "{t=\$2+0; if (up-t<win) print}" | tail -3; echo "== ollama"; curl -s -m 5 http://localhost:11434/api/tags -o /dev/null -w "api_http=%{http_code}\n" || echo "api=down"; echo "== failedsvc"; systemctl --failed --no-legend 2>/dev/null | wc -l; echo "== rebootreq"; [ -f /var/run/reboot-required ] && echo yes || echo no; echo "== inodes"; df -iP / 2>/dev/null | tail -1 | tr -s " " | cut -d" " -f5 | tr -cd "0-9"; echo "== smart"; for d in /dev/sda /dev/sdb /dev/nvme0n1 /dev/mmcblk0; do [ -b "$d" ] || continue; r=$(sudo -n smartctl -H "$d" 2>/dev/null || smartctl -H "$d" 2>/dev/null) || continue; w=$(echo "$r" | grep -oiE "passed|failed" | head -1); [ -n "$w" ] && echo "$d: $w"; done; echo "== end"'
+PROBE='echo "== uptime"; uptime; echo "== df"; df -Ph -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null; echo "== mem"; free -m | head -2; echo "== cores"; nproc; echo "== temp"; (vcgencmd measure_temp 2>/dev/null || awk "{print \$1/1000 \" C\"}" /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo n/a); echo "== oom"; up=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0); dmesg 2>/dev/null | grep -i "killed process" | awk -v up="$up" -v win='"$OOM_WINDOW_SEC"' -F"[][]" "{t=\$2+0; if (up-t<win) print}" | tail -3; echo "== ollama"; curl -s -m 5 http://localhost:11434/api/tags -o /dev/null -w "api_http=%{http_code}\n" || echo "api=down"; echo "== failedsvc"; systemctl --failed --no-legend 2>/dev/null | head -20; echo "== rebootreq"; [ -f /var/run/reboot-required ] && echo yes || echo no; echo "== inodes"; df -iP / 2>/dev/null | tail -1 | tr -s " " | cut -d" " -f5 | tr -cd "0-9"; echo "== smart"; for d in /dev/sda /dev/sdb /dev/nvme0n1 /dev/mmcblk0; do [ -b "$d" ] || continue; r=$(sudo -n smartctl -H "$d" 2>/dev/null || smartctl -H "$d" 2>/dev/null) || continue; w=$(echo "$r" | grep -oiE "passed|failed" | head -1); [ -n "$w" ] && echo "$d: $w"; done; echo "== end"'
 
 DEEP_DISK='echo "== du"; timeout 50 du -sh ~/.ollama/models ~/dual/logs 2>/dev/null; echo "== topdirs"; timeout 50 du -sh ~/* 2>/dev/null | sort -rh | head -6; echo "== journal"; journalctl --disk-usage 2>/dev/null | head -2; echo "== models"; timeout 20 ollama list 2>/dev/null | head -12'
 
@@ -155,6 +155,14 @@ disk_flags_for() { # $1=label $2=probe-output
   done < <(echo "$out" | awk '/^\/dev\// {u=$5; gsub(/%/,"",u); if (u+0>0) print u, $6}')
 }
 
+failed_svc_info() { # $1=probe-output -> "count|name1,name2" (names feed triage so it stops inventing them)
+  local sec n names
+  sec=$(printf '%s' "$1" | awk '/^== failedsvc$/{f=1;next} /^== /{f=0} f')
+  n=$(printf '%s' "$sec" | grep -c .)
+  names=$(printf '%s' "$sec" | sed -E 's/^[^a-zA-Z0-9_@.:-]+//' | awk '{print $1}' | head -5 | paste -sd, -)
+  printf '%s|%s' "$n" "$names"
+}
+
 triage_host_line() { # $1=label $2=probe-output -> compact one-liner for the model
   local label=$1 out=$2 up disk mem oll fsvc rr extra=""
   up=$(printf '%s' "$out" | awk '/^== uptime$/{getline; print; exit}')
@@ -163,8 +171,8 @@ triage_host_line() { # $1=label $2=probe-output -> compact one-liner for the mod
   mem=$(printf '%s' "$out" | awk '$1=="Mem:" {print $7"M avail"}')
   oll=$(printf '%s' "$out" | grep -o 'api_http=[0-9]*\|api=down' | head -1)
   # Extra fragments only when something fired: quiet hosts stay one line.
-  fsvc=$(printf '%s' "$out" | grep -A1 "^== failedsvc$" | tail -1)
-  [ "${fsvc:-0}" -gt 0 ] 2>/dev/null && extra+=" | failed_svc:$fsvc"
+  fsvc=$(failed_svc_info "$out"); fsvc_n=${fsvc%%|*}; fsvc_names=${fsvc#*|}
+  [ "${fsvc_n:-0}" -gt 0 ] 2>/dev/null && extra+=" | failed_svc:$fsvc_n($fsvc_names)"
   rr=$(printf '%s' "$out" | grep -A1 "^== rebootreq$" | tail -1)
   [ "$rr" = "yes" ] && extra+=" | reboot-required"
   printf -- '- %s: %s | worst disk: %s | mem: %s | ollama: %s%s' \
@@ -201,9 +209,9 @@ check_host() { # $1=host $2=label
   fi
   # New health checks: failed services, pending reboot, inode exhaustion,
   # SMART disk health. All best-effort; missing sections parse as clean.
-  fsvc=$(echo "$out" | grep -A1 "^== failedsvc$" | tail -1)
-  if [ "${fsvc:-0}" -gt 0 ] 2>/dev/null; then
-    FLAGS+=("warn:failedsvc:$label has $fsvc failed systemd service(s)")
+  fsvc=$(failed_svc_info "$out"); fsvc_n=${fsvc%%|*}; fsvc_names=${fsvc#*|}
+  if [ "${fsvc_n:-0}" -gt 0 ] 2>/dev/null; then
+    FLAGS+=("warn:failedsvc:$label has $fsvc_n failed systemd service(s): $fsvc_names")
   fi
   if echo "$out" | grep -A1 "^== rebootreq$" | tail -1 | grep -q "^yes$"; then
     FLAGS+=("warn:reboot_required:$label has a pending reboot")
