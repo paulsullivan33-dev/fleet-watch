@@ -108,11 +108,13 @@ notify() { # $1=priority $2=title $3=message [$4=tags]
     log "DRY-RUN would send ntfy (pri $pri): $title"
     return 0
   fi
-  if curl -s -m 15 -H "Title: $title" -H "Priority: $pri" -H "Tags: $tags" \
+  if curl -fsS -m 15 -H "Title: $title" -H "Priority: $pri" -H "Tags: $tags" \
        -d "$msg" "$NTFY_URL" >/dev/null; then
     log "ntfy sent (pri $pri): $title"
+    return 0
   else
     log "ntfy FAILED (pri $pri): $title"
+    return 1
   fi
 }
 
@@ -281,6 +283,7 @@ duel_name() { # $1=pid -> best-effort scenario name from the command line
 
 track_duels() { # $1=pids (space-separated, may be empty); alerts on start/end
   local p cur="" prev pair entry started="" ended=""
+  local delivered=1
   for p in $1; do
     cur+="$p:$(duel_name "$p") "
   done
@@ -295,15 +298,15 @@ track_duels() { # $1=pids (space-separated, may be empty); alerts on start/end
   done
   for pair in $started; do
     entry=${pair#*:}
-    notify 2 "fleet-watch duel started [$(hostname)]" "Duel started on $(hostname): $entry."
+    notify 2 "fleet-watch duel started [$(hostname)]" "Duel started on $(hostname): $entry." || delivered=0
     log "duel started: $entry"
   done
   for pair in $ended; do
     entry=${pair#*:}
-    notify 2 "fleet-watch duel ended [$(hostname)]" "Duel ended on $(hostname): $entry."
+    notify 2 "fleet-watch duel ended [$(hostname)]" "Duel ended on $(hostname): $entry." || delivered=0
     log "duel ended: $entry"
   done
-  state_set duel_pids "$cur"
+  [ "$delivered" -eq 0 ] || state_set duel_pids "$cur"
   REPORT+="[duels] tracked: ${cur:-none} (was: ${prev:-none})"$'\n'
 }
 
@@ -396,7 +399,7 @@ worst_sev() { # prints OK/WARN/CRIT
     for f in "${FLAGS[@]}"; do
       sev=${f%%:*}
       [ "$sev" = "warn" ] && s="WARN"
-      [ "$sev" = "crit" ] && s="CRIT"
+      if [ "$sev" = "crit" ]; then echo "CRIT"; return 0; fi
     done
   fi
   echo "$s"
@@ -429,7 +432,7 @@ maybe_alert() { # $1=sev $2=reason $3=full text [$4=dedup key]
   fi
   local pri=3 tags="warning"
   if [ "$sev" = "CRIT" ]; then pri=4; tags="rotating_light"; fi
-  notify "$pri" "fleet-watch $sev [$(hostname)]" "$full" "$tags"
+  notify "$pri" "fleet-watch $sev [$(hostname)]" "$full" "$tags" || return 1
   state_set last_alert_hash "$hash"
   state_set last_alert_time "$now"
   state_set last_verdict "$sev"
@@ -488,17 +491,22 @@ SEV=$(worst_sev)
 LAST=$(state_get last_verdict); LAST=${LAST:-OK}
 
 if [ "$SEV" = "OK" ]; then
+  RECOVERY_DELIVERED=1
   if [ "$LAST" != "OK" ]; then
-    notify 2 "fleet-watch recovered [$(hostname)]" "All checks clear again. Previous state: $LAST." "white_check_mark"
-    log "recovered (was $LAST)"
+    if notify 2 "fleet-watch recovered [$(hostname)]" "All checks clear again. Previous state: $LAST." "white_check_mark"; then
+      log "recovered (was $LAST)"
+    else
+      RECOVERY_DELIVERED=0
+    fi
   fi
   # Daily alive ping so silence means "working", not "broken".
   now=$(date +%s); lp=$(state_get last_daily_ping); lp=${lp:-0}
   if [ $(( now - lp )) -gt 86400 ]; then
-    notify 1 "fleet-watch alive [$(hostname)]" "Daily check-in: all fleet checks clear." "zzz"
-    state_set last_daily_ping "$now"
+    if notify 1 "fleet-watch alive [$(hostname)]" "Daily check-in: all fleet checks clear." "zzz"; then
+      state_set last_daily_ping "$now"
+    fi
   fi
-  state_set last_verdict "OK"
+  [ "$RECOVERY_DELIVERED" -eq 0 ] || state_set last_verdict "OK"
   log "OK"
 else
   # OOM safety (local triage only): if a duel is mid-turn with a *different*
