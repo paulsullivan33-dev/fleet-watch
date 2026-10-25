@@ -12,8 +12,12 @@
 #      since run_results.log only updates when a duel completes) for
 #      STUCK_AFTER_MIN minutes + llama-server pegged = stuck.
 #   3. Checks the peer monitor's heartbeat (Q watches Pi, Pi watches Q).
-#   4. If anything looks off, asks the local small model to triage and
-#      explain; otherwise stays quiet (no model call on clean runs).
+#   4. If anything looks off, asks the triage model to explain — one
+#      small call per flagged host, and one per flagged filesystem, so
+#      a call only ever sees the host/mount its own flags belong to.
+#      The script assembles the alert itself and owns the severity and
+#      the (read-only) suggested checks; the model only writes prose.
+#      Clean runs make no model call at all.
 #   5. Sends ntfy alerts ONLY on state changes (no repeat spam),
 #      plus a low-priority "recovered" note and a daily alive ping.
 #
@@ -101,6 +105,25 @@ state_set() {
   mv "$tmp" "$STATE_FILE"
 }
 
+state_key_for() { # $1=arbitrary label -> [A-Za-z0-9_] suffix safe for state keys and filenames
+  printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'
+}
+
+# Unreachable debounce: a single missed run is usually a reboot, so the
+# crit flag only fires from the second consecutive miss. Returns 0 when
+# this miss should alert.
+unreach_should_flag() { # $1=label
+  local key n
+  key="unreach_$(state_key_for "$1")"
+  n=$(state_get "$key"); n=${n:-0}; n=$((n+1))
+  state_set "$key" "$n"
+  [ "$n" -ge 2 ]
+}
+
+unreach_clear() { # $1=label; host answered again — reset the miss counter
+  state_set "unreach_$(state_key_for "$1")" 0
+}
+
 notify() { # $1=priority $2=title $3=message [$4=tags]
   local pri=$1 title=$2 msg=$3 tags=${4:-satellite}
   if [ "$DRY_RUN" = "1" ]; then
@@ -119,6 +142,7 @@ notify() { # $1=priority $2=title $3=message [$4=tags]
 }
 
 FLAGS=()
+declare -A DETAIL_BY_HOST=()
 REPORT=""
 
 # One SSH call per host, parse locally.
@@ -200,10 +224,17 @@ check_host() { # $1=host $2=label
   out=$(run_probe "$host") || rc=$?
   if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
     REPORT+="[$label] UNREACHABLE"$'\n'
-    TRIAGE_SUMMARY+="- $label: UNREACHABLE via SSH"$'\n'
-    FLAGS+=("crit:unreachable:$label did not answer SSH")
+    if unreach_should_flag "$label"; then
+      TRIAGE_SUMMARY+="- $label: UNREACHABLE via SSH (2+ consecutive runs)"$'\n'
+      FLAGS+=("crit:unreachable:$label did not answer SSH (2+ consecutive runs)")
+    else
+      # First miss is usually a reboot — note it, but don't alert yet.
+      TRIAGE_SUMMARY+="- $label: UNREACHABLE via SSH (first miss — alerting starts at 2 consecutive)"$'\n'
+      log "$label unreachable: first consecutive miss (debounced)"
+    fi
     return
   fi
+  unreach_clear "$label"
   REPORT+="[$label]"$'\n'"$out"$'\n'
   TRIAGE_SUMMARY+="$(triage_host_line "$label" "$out")"$'\n'
   disk_flags_for "$label" "$out"
@@ -263,7 +294,9 @@ check_host() { # $1=host $2=label
     done
     detail=$(run_deep_disk "$host" "$deep_cmd")
     REPORT+="[disk detail $label]"$'\n'"$detail"$'\n'
-    TRIAGE_DETAIL+="--- disk detail: $label"$'\n'"$detail"$'\n'
+    # Kept per host (not one shared blob): per-filesystem triage calls
+    # extract only their own mount's section from this text.
+    DETAIL_BY_HOST["$label"]="$detail"
   fi
 }
 
@@ -374,18 +407,18 @@ peer_check() {
   fi
 }
 
-call_model() { # reads $TRIAGE_FILE (compact), prints model response
-  python3 - "$PROMPT_FILE" "$TRIAGE_FILE" "$MODEL" "$OLLAMA_HOST" <<'PYEOF' 2>"$STATE_DIR/triage_err.txt"
+call_model() { # $1=scoped group input file; prints model response
+  python3 - "$PROMPT_FILE" "$1" "$MODEL" "$OLLAMA_HOST" <<'PYEOF' 2>"$STATE_DIR/triage_err.txt"
 import json, sys, urllib.request
 prompt_path, report_path, model, host = sys.argv[1:5]
 prompt = open(prompt_path).read()
 report = open(report_path).read()
 body = json.dumps({
     "model": model,
-    "prompt": prompt + "\n\n# CURRENT FLEET SUMMARY (times America/Chicago)\n" + report,
+    "prompt": prompt + "\n\n# CURRENT FINDINGS — one issue group (times America/Chicago)\n" + report,
     "stream": False,
     "think": False,  # qwen3 thinking trace is pure overhead for a 2-sentence verdict; on slow ARM boxes it blows the 300s timeout
-    "options": {"num_predict": 150},  # hard-cap output: 2 sentences + VERDICT + suggestions fits easily; stops rambling/repetition from eating the timeout
+    "options": {"num_predict": 150},  # hard-cap output: a couple of plain sentences per group fits easily; stops rambling/repetition from eating the timeout
 }).encode()
 req = urllib.request.Request(host + "/api/generate", data=body,
                              headers={"Content-Type": "application/json"})
@@ -408,6 +441,121 @@ worst_sev() { # prints OK/WARN/CRIT
 rule_verdict() { # fallback when the model is unavailable
   local f rest
   for f in "${FLAGS[@]}"; do rest=${f#*:}; echo "- $rest"; done
+}
+
+# ---- Split triage -------------------------------------------------------
+# Triage runs as one model call per issue group: per flagged host, and
+# per flagged filesystem for disk flags. A call's input contains ONLY its
+# own group's flags (plus that host's one-line summary and, for disk
+# groups, only that mount's deep-disk section), so the model's prose
+# cannot wander onto the wrong host or the wrong disk — the failure mode
+# behind the Oct 2026 false triage reports. The script assembles the
+# alert text, owns the severity, and chooses any suggested check.
+
+flag_kind() { # $1=flag -> kind (second field)
+  local f=${1#*:}
+  printf '%s' "${f%%:*}"
+}
+
+flag_rest() { # $1=flag -> finding text after "sev:kind:"
+  printf '%s' "${1#*:*:}"
+}
+
+flag_group() { # $1=flag -> owning label (host label, peer host, SELF_LABEL, "triage")
+  local kind rest
+  kind=$(flag_kind "$1"); rest=$(flag_rest "$1")
+  case "$kind" in
+    duel_stuck|duel_idle) printf '%s' "$SELF_LABEL" ;;
+    triage_endpoint) printf 'triage' ;;
+    *) printf '%s' "${rest%% *}" ;;
+  esac
+}
+
+flag_mount() { # $1=disk flag -> mount point (second word of the finding)
+  local rest
+  rest=$(flag_rest "$1")
+  printf '%s' "${rest#* }" | cut -d' ' -f1
+}
+
+group_key_for() { # $1=flag -> group key: label, or label|disk|mount for disk flags
+  if [ "$(flag_kind "$1")" = "disk" ]; then
+    printf '%s|disk|%s' "$(flag_group "$1")" "$(flag_mount "$1")"
+  else
+    flag_group "$1"
+  fi
+}
+
+group_flags_text() { # $1=group key -> "- <finding>" lines for that group
+  local f
+  for f in "${FLAGS[@]}"; do
+    [ "$(group_key_for "$f")" = "$1" ] && echo "- $(flag_rest "$f")"
+  done
+}
+
+mount_section() { # $1=deep-disk detail text $2=mount -> only that mount's topdirs block
+  printf '%s\n' "$1" | awk -v hdr="== topdirs $2" '
+    /^== / { if (f) exit; if ($0 == hdr) f=1 }
+    f { print }'
+}
+
+hint_for() { # $1=kind $2=mount (disk groups) -> one code-chosen READ-ONLY check, or nothing
+  case "$1" in
+    disk) printf 'Check: du -sh %s/* 2>/dev/null | sort -rh | head' "$2" ;;
+    inodes) printf 'Check: df -i %s' "${2:-/}" ;;
+    failedsvc) printf 'Check: systemctl --failed, then journalctl -u <unit> -n 50 for the one that matters' ;;
+    smart) printf 'Check: sudo smartctl -a <device> for the full SMART report' ;;
+    readonly) printf 'Check: dmesg | grep -iE "error|remount" for what forced it read-only' ;;
+    dmesg) printf 'Check: dmesg | grep -iE "I/O error|EXT4-fs error" | tail' ;;
+    temp) printf 'Check: uptime for load; vcgencmd measure_temp or sensors for cooling' ;;
+    ollama_down) printf 'Check: systemctl status ollama; curl -s localhost:11434/api/tags' ;;
+    oom) printf 'Check: dmesg | grep -i "killed process" to see what was killed' ;;
+    clock) printf 'Check: timedatectl; systemctl status systemd-timesyncd' ;;
+    duel_stuck|duel_idle) printf 'Check: tail the newest log in ~/dual/output/logs' ;;
+    peer_silent|peer_stale) printf 'Check: ssh to the peer and tail ~/.fleet-watch/fleet-watch.log' ;;
+    unreachable) printf 'Check: ping the host, then ssh -v to find the failure point' ;;
+    reboot_required) printf 'Note: reboot when convenient to finish pending updates' ;;
+    *) printf '' ;;
+  esac
+}
+
+group_hint() { # $1=group key -> hint for the group's first flag, or nothing
+  local f mount=""
+  case "$1" in *"|disk|"*) mount=${1##*|disk|} ;; esac
+  for f in "${FLAGS[@]}"; do
+    if [ "$(group_key_for "$f")" = "$1" ]; then
+      hint_for "$(flag_kind "$f")" "$mount"
+      return
+    fi
+  done
+}
+
+build_group_input() { # $1=group key; prints the scoped model input for that group
+  local key=$1 label mount="" f has_duel=0 line
+  label=${key%%|*}
+  case "$key" in *"|disk|"*) mount=${key##*|disk|} ;; esac
+  echo "# FINDINGS (only these — one host${mount:+, one filesystem})"
+  for f in "${FLAGS[@]}"; do
+    if [ "$(group_key_for "$f")" = "$key" ]; then
+      echo "- $(flag_rest "$f")"
+      case "$(flag_kind "$f")" in duel_stuck|duel_idle) has_duel=1 ;; esac
+    fi
+  done
+  line=$(printf '%s' "$TRIAGE_SUMMARY" | grep -F -- "- $label:" | head -1)
+  if [ -n "$line" ]; then
+    echo "# HOST SUMMARY"
+    echo "$line"
+  fi
+  if [ "$has_duel" -eq 1 ]; then
+    echo "# DUEL STATE"
+    printf '%s\n' "$REPORT" | grep '^\[duels\]' || true
+  fi
+  if [ -n "${PEER_HOST:-}" ] && [ "$label" = "$PEER_HOST" ]; then
+    printf '%s\n' "$REPORT" | grep '^\[peer ' | head -1 || true
+  fi
+  if [ -n "$mount" ]; then
+    echo "# DISK DETAIL — largest entries on $mount ONLY"
+    mount_section "${DETAIL_BY_HOST[$label]:-}" "$mount"
+  fi
 }
 
 maybe_alert() { # $1=sev $2=reason $3=full text [$4=dedup key]
@@ -446,13 +594,14 @@ log "run start (DRY_RUN=$DRY_RUN)"
 printf '%s\n' "$PROBE" | log_block "command PROBE"
 printf '%s\n' "$DEEP_DISK" | log_block "command DEEP_DISK"
 REPORT="# fleet-watch run $(date '+%F %T %Z')"$'\n'
-# Compact triage input (built alongside REPORT): the full report is too many
-# tokens to prefill inside the 300s model timeout on ARM (~2.6 tok/s), so the
-# model gets flags + one-line host summaries + disk detail instead.
+# Compact triage inputs (built alongside REPORT): the full report is too
+# many tokens to prefill inside the 300s model timeout on ARM (~2.6 tok/s),
+# so the model gets scoped per-group inputs instead (see build_group_input).
 TRIAGE_SUMMARY=""
-TRIAGE_DETAIL=""
+SELF_LABEL="self($(hostname))"
+ENDPOINT_DOWN=0
 
-check_host "localhost" "self($(hostname))"
+check_host "localhost" "$SELF_LABEL"
 for h in $FLEET_HOSTS; do
   # Peer is checked separately via heartbeat; don't double-cover it here.
   case " $PEER_HOST " in *" $h "*) continue;; esac
@@ -465,25 +614,22 @@ echo "$REPORT" > "$REPORT_FILE"
 # Full results in the log: this is the "what was checked" record.
 printf '%s\n' "$REPORT" | log_block "report"
 
-# Compact model input, written every run (cheap); the triage call below reads
-# it instead of the full report. Also logged so the record shows exactly what
-# the model saw.
+# Run overview, written every run (cheap) and logged: flags + host
+# one-liners. The model never sees this file — its inputs are the scoped
+# per-group files built in the triage section below, each logged too.
 TRIAGE_FILE="$STATE_DIR/triage_input.txt"
 {
   echo "# FLAGS (what fired this run)"
   rule_verdict
   echo "# HOST SUMMARIES (one line each)"
   printf '%s' "$TRIAGE_SUMMARY"
-  if [ -n "$TRIAGE_DETAIL" ]; then
-    echo "# DISK DETAIL (only hosts that tripped a disk threshold)"
-    printf '%s' "$TRIAGE_DETAIL"
-  fi
 } > "$TRIAGE_FILE"
-printf '%s\n' "$(cat "$TRIAGE_FILE")" | log_block "triage input"
+printf '%s\n' "$(cat "$TRIAGE_FILE")" | log_block "triage overview"
 
 # The triage model lives at OLLAMA_HOST now; if it's unreachable the model
 # call below degrades silently to rule-based verdicts, so flag it explicitly.
 if ! curl -s -m 10 "$OLLAMA_HOST/api/tags" -o /dev/null; then
+  ENDPOINT_DOWN=1
   FLAGS+=("warn:triage_endpoint:OLLAMA_HOST $OLLAMA_HOST not answering — triage degraded to rule-based")
 fi
 
@@ -512,36 +658,71 @@ else
   # OOM safety (local triage only): if a duel is mid-turn with a *different*
   # model loaded, don't ask Ollama to load the triage model too — two 1.7B
   # models in memory OOM-killed these boxes before. With a remote OLLAMA_HOST
-  # the triage model never loads locally, so the guard is skipped and triage
-  # always runs. Fall back to the rule-based verdict instead (the VERDICT
-  # parse below handles the empty answer).
-  ANSWER=""
+  # the triage model never loads locally, so the guard is skipped. A dead
+  # triage endpoint (checked above) also skips every call: groups fall back
+  # to their raw flags and the alert still goes out, assembled by code.
+  ALLOW_TRIAGE=1
   case "$OLLAMA_HOST" in
     http://localhost*|http://127.*|https://localhost*|https://127.*)
       LOCAL_TRIAGE=1 ;;
     *) LOCAL_TRIAGE=0 ;;
   esac
-  if [ "$LOCAL_TRIAGE" -eq 0 ] \
-     || ! pgrep -f "[o]llama_duel.py" >/dev/null 2>&1 \
-     || ollama ps 2>/dev/null | grep -q "$MODEL"; then
-    log "triage: calling $MODEL at $OLLAMA_HOST"
-    ANSWER=$(call_model)
-    printf '%s\n' "$ANSWER" | log_block "triage response ($MODEL)"
-    if [ -z "$ANSWER" ]; then
-      log "triage call failed: $(head -c 300 "$STATE_DIR/triage_err.txt" 2>/dev/null | tr '\n' ' ')"
+  if [ "$LOCAL_TRIAGE" -eq 1 ] \
+     && pgrep -f "[o]llama_duel.py" >/dev/null 2>&1 \
+     && ! ollama ps 2>/dev/null | grep -q "$MODEL"; then
+    ALLOW_TRIAGE=0
+    log "triage model calls skipped: duel active with another model loaded"
+  fi
+  [ "$ENDPOINT_DOWN" -eq 1 ] && ALLOW_TRIAGE=0
+
+  # Split triage: group the flags, one model call per group, and assemble
+  # the alert here. Severity is worst_sev over the rule flags — the model
+  # never sets it; it only explains its own group's flags.
+  GROUP_KEYS=()
+  declare -A GROUP_SEEN=()
+  for f in "${FLAGS[@]}"; do
+    k=$(group_key_for "$f")
+    if [ -z "${GROUP_SEEN[$k]:-}" ]; then GROUP_SEEN[$k]=1; GROUP_KEYS+=("$k"); fi
+  done
+  if [ "$ALLOW_TRIAGE" -eq 1 ]; then
+    log "triage: calling $MODEL at $OLLAMA_HOST for ${#GROUP_KEYS[@]} issue group(s)"
+  fi
+  BODY=""
+  MODEL_ANY=0
+  for key in "${GROUP_KEYS[@]}"; do
+    g_label=${key%%|*}
+    g_mount=""; case "$key" in *"|disk|"*) g_mount=${key##*|disk|} ;; esac
+    g_file="$STATE_DIR/triage_input.$(state_key_for "$key").txt"
+    build_group_input "$key" > "$g_file"
+    printf '%s\n' "$(cat "$g_file")" | log_block "triage input [$key]"
+    g_answer=""
+    if [ "$ALLOW_TRIAGE" -eq 1 ]; then
+      g_answer=$(call_model "$g_file")
+      printf '%s\n' "$g_answer" | log_block "triage response [$key]"
+      if [ -z "$g_answer" ]; then
+        log "triage call failed for $key: $(head -c 300 "$STATE_DIR/triage_err.txt" 2>/dev/null | tr '\n' ' ')"
+      fi
     fi
+    # Strip any verdict/suggestion lines the model still tries to emit —
+    # severity and suggested checks belong to this script, not the model.
+    g_text=$(printf '%s' "$g_answer" | grep -viE '^(VERDICT|SUGGESTION):' | sed -e 's/^[[:space:]]*//' -e '/^$/d' | head -4)
+    if [ -n "$g_mount" ]; then heading="[$g_label — disk $g_mount]"; else heading="[$g_label]"; fi
+    BODY+="$heading"$'\n'
+    if [ -n "$g_text" ]; then
+      MODEL_ANY=1
+      BODY+="$g_text"$'\n'
+    else
+      BODY+="$(group_flags_text "$key")"$'\n'
+    fi
+    g_hint=$(group_hint "$key")
+    [ -n "$g_hint" ] && BODY+="$g_hint"$'\n'
+  done
+  if [ "$MODEL_ANY" -eq 1 ]; then
+    FULL="fleet-watch $SEV — per-issue triage:"$'\n'"$BODY"
   else
-    log "triage model call skipped: duel active with another model loaded"
+    FULL="fleet-watch $SEV (model triage unavailable — raw findings):"$'\n'"$BODY"
   fi
-  VERDICT=$(echo "$ANSWER" | grep -i -m1 "^VERDICT:" || true)
-  if [ -z "$VERDICT" ]; then
-    # Model unavailable or misbehaved: fall back to the raw flags.
-    VERDICT="VERDICT: $SEV: (model triage unavailable) $(rule_verdict | tr '\n' ';')"
-    FULL="fleet-watch $SEV (model triage unavailable — raw findings):"$'\n'"$(rule_verdict)"
-  else
-    FULL="fleet-watch triage ($SEV):"$'\n'"$ANSWER"
-  fi
-  REASON=$(echo "$VERDICT" | sed -E 's/^VERDICT:[[:space:]]*//I' | cut -c1-160)
+  REASON=$(rule_verdict | head -1 | sed 's/^- //' | cut -c1-160)
   # Dedup on the rule flags (deterministic), not the model prose.
   maybe_alert "$SEV" "$REASON" "$FULL" "$SEV|$(rule_verdict | tr '\n' ';')"
   log "$SEV: $REASON"

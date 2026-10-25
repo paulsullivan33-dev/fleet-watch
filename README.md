@@ -23,14 +23,17 @@ Every run (cron, every 10 minutes):
    Two consecutive failures = the peer is silent (CRIT) — so if one box
    dies, the other tells you.
 4. **Model triage, only when something looks off**: clean runs skip the
-   model call entirely. When a check trips, a model on the always-on AI
-   box (see Remote triage below) explains the problem in plain language
-   and suggests a fix. If the triage endpoint is unreachable, the alert
-   goes out with the rule-based findings instead — plus a WARN that the
-   triage brain is offline.
-5. **Disk advisor**: when a mount crosses the warn/crit threshold, the
-   triage names what's eating the space (model blobs, logs, journals)
-   and suggests concrete cleanup commands, cheapest first.
+   model entirely. When checks trip, the model is called once per issue
+   group — per flagged host, and per flagged filesystem — and each call
+   sees only its own group's findings, so its explanation can't wander
+   onto the wrong host or the wrong disk. The script assembles the
+   alert, owns the severity, and appends a read-only check chosen by
+   code; the model only writes plain-language prose. If the triage
+   endpoint is unreachable, the alert goes out with the rule-based
+   findings instead — plus a WARN that the triage brain is offline.
+5. **Disk detail**: when a mount crosses the warn/crit threshold, the
+   run collects the largest entries on that mount, and the disk group's
+   triage call sees only that mount's entries.
 
 ## Coexistence with duels
 
@@ -74,8 +77,8 @@ if it's unreachable; triage then falls back to the rule-based verdicts.
 
 - `fleet-watch.sh` — the monitor (bash, zero non-standard deps beyond
   `ssh`, `curl`, `python3`, `ollama`)
-- `triage-prompt.txt` — baselines, few-shot examples, and output format
-  for the triage model
+- `triage-prompt.txt` — the triage model's instructions (explain-only:
+  the script owns severity and suggested checks, not the model)
 - `fleet-watch.conf.q` / `fleet-watch.conf.pi` — per-box config templates;
   copy the right one to `fleet-watch.conf` and edit the marked lines (peer
   host, fleet hosts, ntfy topic URL, `OLLAMA_HOST`/`MODEL` for remote triage)

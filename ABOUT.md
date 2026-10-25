@@ -23,11 +23,13 @@ the job alone; together they cover each other.
   with a six-hour reminder for still-broken issues and a "recovered" note
   when things clear. A daily low-priority ping proves the monitor is
   alive, so silence means "working," not "broken."
-- **Rules detect, models judge.** Deterministic checks (disk, services,
-  reachability) decide *whether* something is wrong; a small language
-  model explains *what* it means in plain language and suggests a fix.
-  The model only runs when a check already tripped — clean runs never
-  pay for inference.
+- **Rules detect and decide, models explain.** Deterministic checks
+  (disk, services, reachability) decide *whether* something is wrong
+  and *how bad* it is; a small language model only explains *what it
+  means* in plain language — one flagged host or filesystem at a time,
+  seeing nothing else — and any suggested check is chosen by the
+  script, read-only, never by the model. The model only runs when a
+  check already tripped — clean runs never pay for inference.
 - **Don't disturb running work.** Health checks are plain SSH. Triage
   runs on a bigger always-on box over the LAN, so the little monitors
   never load a model locally and duels are never interrupted.
@@ -46,3 +48,8 @@ the job alone; together they cover each other.
   wedged batch, failed-service and reboot-required checks from a box
   that quietly degraded after an update, SMART health for aging spinning
   disks.
+- Triage narration itself caused false reports when one model call saw
+  the whole fleet — a nearly-full data disk got blamed on home-directory
+  contents from a different filesystem, with cleanup suggestions to
+  match — so triage split into per-host, per-filesystem calls, and the
+  script took back assembly, severity, and suggested checks.
