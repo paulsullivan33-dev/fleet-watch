@@ -12,13 +12,27 @@
 #      since run_results.log only updates when a duel completes) for
 #      STUCK_AFTER_MIN minutes + llama-server pegged = stuck.
 #   3. Checks the peer monitor's heartbeat (Q watches Pi, Pi watches Q).
-#   4. If anything looks off, asks the triage model to explain — one
+#   4. Expansion checks (2026-11-02), all config-driven — an empty list
+#      disables the check:
+#      - fileList: each fileList web UI answers HTTP; on the Vostro the
+#        job worker process is alive too (a dead worker strands queued
+#        jobs silently while the web UI looks fine).
+#      - NerdMiners: a miner that was in the swarm and drops out alerts
+#        (debounced); a never-seen miner never alerts.
+#      - Failed systemd units, daily: only units NEWLY failed since the
+#        stored per-host baseline alert; pre-existing ones baseline
+#        silently on first sight.
+#      - usenetFetch stall (Vostro): process running + releases pending
+#        + state-DB mtime, process CPU time and pending count ALL frozen
+#        for USENET_STALL_MIN minutes = stalled. Not running = normal,
+#        always silent (it only runs during catch-ups).
+#   5. If anything looks off, asks the triage model to explain — one
 #      small call per flagged host, and one per flagged filesystem, so
 #      a call only ever sees the host/mount its own flags belong to.
 #      The script assembles the alert itself and owns the severity and
 #      the (read-only) suggested checks; the model only writes prose.
 #      Clean runs make no model call at all.
-#   5. Sends ntfy alerts ONLY on state changes (no repeat spam),
+#   6. Sends ntfy alerts ONLY on state changes (no repeat spam),
 #      plus a low-priority "recovered" note and a daily alive ping.
 #
 # Every run appends to ~/.fleet-watch/fleet-watch.log: the exact probe
@@ -63,6 +77,26 @@ OOM_WINDOW_SEC=$(( OOM_WINDOW_HOURS * 3600 ))
 # entirely: no ollama_down flag, no alert. Empty (default) keeps the old
 # behavior of checking Ollama on every host.
 : "${OLLAMA_HOSTS:=}"
+# Expansion checks (2026-11-02). Empty list/string disables the check.
+# fileList web UIs (bare IPs; the app is healthy when it returns ANY HTTP
+# status — its normal answer is a 302 redirect to the login page).
+: "${FILELIST_HOSTS:=192.168.1.119 192.168.1.118 192.168.1.103 192.168.1.248}"
+: "${FILELIST_PORT:=8081}"
+# SSH target whose fileList job worker (job_worker.py) is also checked;
+# matched against FILELIST_HOSTS by the part after "@". Empty = web only.
+: "${FILELIST_WORKER_HOST:=paul@192.168.1.119}"
+# NerdMiner IPs; each serves open JSON at http://<ip>/swarm and the swarm
+# membership is the union of every answering miner's "devices" list.
+: "${MINER_IPS:=192.168.1.125 192.168.1.154 192.168.1.188 192.168.1.190}"
+# Daily newly-failed-systemd-units check (SSH targets as SSH understands
+# them). Hosts the watcher cannot reach are noted as coverage gaps in the
+# report; they never alert.
+: "${FAILED_UNIT_HOSTS:=paul@192.168.1.236 paul@192.168.1.119 paul@192.168.1.118 paul@192.168.1.103 paul@192.168.1.248 paul@192.168.1.185 paul@192.168.1.165 paul@192.168.1.179}"
+: "${FAILED_UNITS_INTERVAL_H:=23}"
+# usenetFetch stall check: SSH target of the box running it, and how long
+# every sign of life must stay frozen before it counts as stalled.
+: "${USENET_HOST:=paul@192.168.1.119}"
+: "${USENET_STALL_MIN:=60}"
 
 STATE_DIR="$HOME/.fleet-watch"
 LOG_FILE="$STATE_DIR/fleet-watch.log"
@@ -407,6 +441,308 @@ peer_check() {
   fi
 }
 
+# ---- Expansion checks (2026-11-02) -------------------------------------
+# Same house rules as the checks above: probe from this box, parse
+# locally, alert only on state changes, debounce transient misses with
+# the same unreach counters, hints chosen by hint_for. Each check splits
+# into a probe (I/O, stubbed in tests) and an eval (pure state logic).
+
+in_list() { # $1=item $2=space-separated list
+  case " $2 " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+# -- fileList -------------------------------------------------------------
+# The app is healthy when it returns ANY HTTP status (its normal answer
+# is a 302 to the login page); "000" means nothing answered. On the
+# worker host the job worker matters as much as the web UI: on
+# 2026-11-01/02 the worker was dead for a day, the web UI looked fine,
+# and a queued job sat stranded. The worker holds an flock on
+# ~/.local/state/filelist/jobs/worker.lock for its whole life, and its
+# process (job_worker.py, run beside app.py by run.sh) is the simplest
+# read-only liveness signal.
+
+filelist_web_code() { # $1=ip -> HTTP status code, "000" when no answer
+  local code
+  code=$(curl -s -o /dev/null -w "%{http_code}" -m 5 "http://$1:${FILELIST_PORT}/" 2>/dev/null) || code="000"
+  printf '%s' "${code:-000}"
+}
+
+filelist_worker_state() { # -> up|down|unreachable (SSH to FILELIST_WORKER_HOST)
+  # Probe string carries no plain "job_worker.py" outside the bracketed
+  # pgrep pattern, so the remote shell's own command line cannot
+  # self-match the search.
+  local out
+  out=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$FILELIST_WORKER_HOST" \
+        'pgrep -f "[j]ob_worker.py" >/dev/null 2>&1 && echo up || echo down' 2>/dev/null) \
+    || { printf 'unreachable'; return; }
+  case "$out" in
+    up|down) printf '%s' "$out" ;;
+    *) printf 'unreachable' ;;
+  esac
+}
+
+filelist_eval() { # $1=ip $2=http code $3=worker (up|down|skip|unreachable)
+  local ip=$1 code=$2 worker=$3 label="filelist-$1"
+  if [ -n "$code" ] && [ "$code" != "000" ]; then
+    unreach_clear "$label"
+    REPORT+="[filelist $ip] web answering (HTTP $code)"$'\n'
+    TRIAGE_SUMMARY+="- $ip: fileList web OK (HTTP $code)"$'\n'
+  else
+    REPORT+="[filelist $ip] web NOT answering"$'\n'
+    TRIAGE_SUMMARY+="- $ip: fileList web not answering"$'\n'
+    if unreach_should_flag "$label"; then
+      FLAGS+=("warn:filelist:$ip fileList web UI not answering on http://$ip:${FILELIST_PORT}/ (2+ consecutive checks)")
+    else
+      log "filelist $ip: first consecutive web miss (debounced)"
+    fi
+  fi
+  case "$worker" in
+    up)
+      unreach_clear "filelist-worker"
+      REPORT+="[filelist $ip] job worker running"$'\n'
+      ;;
+    down)
+      REPORT+="[filelist $ip] job worker NOT running"$'\n'
+      TRIAGE_SUMMARY+="- $ip: fileList job worker NOT running"$'\n'
+      if unreach_should_flag "filelist-worker"; then
+        FLAGS+=("warn:filelist:$ip fileList job worker (job_worker.py) not running — queued jobs will sit stranded")
+      else
+        log "filelist worker: first consecutive miss (debounced)"
+      fi
+      ;;
+    unreachable)
+      REPORT+="[filelist $ip] job worker state unknown (SSH to $FILELIST_WORKER_HOST failed)"$'\n'
+      ;;
+  esac
+}
+
+check_filelist() {
+  [ -z "$FILELIST_HOSTS" ] && return 0
+  local ip code worker worker_ip=""
+  [ -n "$FILELIST_WORKER_HOST" ] && worker_ip=${FILELIST_WORKER_HOST##*@}
+  for ip in $FILELIST_HOSTS; do
+    code=$(filelist_web_code "$ip")
+    worker="skip"
+    if [ -n "$worker_ip" ] && [ "$ip" = "$worker_ip" ]; then
+      worker=$(filelist_worker_state)
+    fi
+    filelist_eval "$ip" "$code" "$worker"
+  done
+}
+
+# -- NerdMiners -----------------------------------------------------------
+# Each miner serves open JSON at http://<ip>/swarm; the "devices" array
+# in any one answer lists the whole swarm, so membership is the union
+# over every miner that answers (plus the answering IPs themselves).
+# State: miners_seen (every IP ever observed — a miner that has never
+# been seen never alerts, so a retired/never-installed unit stays quiet)
+# and miners_down (IPs currently counted as dropped). Drop-outs reuse
+# the 2-consecutive-miss debounce; recovery is logged and reported.
+
+miner_swarm_json() { # $1=ip -> swarm JSON on stdout; nonzero rc = no answer
+  curl -fsS -m 5 "http://$1/swarm" 2>/dev/null
+}
+
+miner_present_set() { # -> space-separated present IPs (responders + union)
+  local ip json present=""
+  for ip in $MINER_IPS; do
+    json=$(miner_swarm_json "$ip") || continue
+    present+="$ip "
+    present+=$(printf '%s' "$json" | python3 -c 'import json,sys
+try:
+  d=json.load(sys.stdin)
+  print(" ".join(sorted({str(x.get("ip","")) for x in d.get("devices",[])} - {""})))
+except Exception:
+  pass' 2>/dev/null)
+    present+=" "
+  done
+  # A responder also names itself in its own devices list — dedupe.
+  printf '%s' "$present" | tr -s ' ' '\n' | sort -u | paste -sd' ' -
+}
+
+miners_eval() { # $1=present IPs (space-separated)
+  local present=$1 ip seen down new_seen new_down=""
+  seen=$(state_get miners_seen); seen=${seen:-}
+  down=$(state_get miners_down); down=${down:-}
+  new_seen=$seen
+  for ip in $MINER_IPS; do
+    if in_list "$ip" "$present"; then
+      unreach_clear "miner-$ip"
+      in_list "$ip" "$new_seen" || new_seen="$new_seen $ip"
+      if in_list "$ip" "$down"; then
+        REPORT+="[miners] $ip back in the swarm (recovered)"$'\n'
+        TRIAGE_SUMMARY+="- $ip: NerdMiner back in the swarm"$'\n'
+        log "miner $ip recovered"
+      else
+        TRIAGE_SUMMARY+="- $ip: NerdMiner in swarm"$'\n'
+      fi
+    elif in_list "$ip" "$down"; then
+      new_down="$new_down $ip"
+      TRIAGE_SUMMARY+="- $ip: NerdMiner still out of the swarm"$'\n'
+    elif in_list "$ip" "$seen"; then
+      TRIAGE_SUMMARY+="- $ip: NerdMiner missing from swarm"$'\n'
+      if unreach_should_flag "miner-$ip"; then
+        FLAGS+=("warn:miner_down:$ip NerdMiner has dropped out of the swarm (absent 2+ consecutive checks)")
+        new_down="$new_down $ip"
+      fi
+    else
+      REPORT+="[miners] $ip not present (never seen — not alerting)"$'\n'
+      TRIAGE_SUMMARY+="- $ip: NerdMiner never seen (not alerting)"$'\n'
+    fi
+  done
+  new_seen=$(printf '%s' "$new_seen" | sed -e 's/^ *//' -e 's/ *$//')
+  new_down=$(printf '%s' "$new_down" | sed -e 's/^ *//' -e 's/ *$//')
+  state_set miners_seen "$new_seen"
+  state_set miners_down "$new_down"
+  REPORT+="[miners] present:${present:- none} | down:${new_down:- none}"$'\n'
+}
+
+check_miners() {
+  [ -z "$MINER_IPS" ] && return 0
+  local present
+  present=$(miner_present_set)
+  miners_eval "$present"
+}
+
+# -- Failed systemd units (daily, newly-failed only) ----------------------
+# The 10-minute PROBE already reports failed units on FLEET_HOSTS; this
+# is the daily, per-unit companion for the wider fleet: a stored per-host
+# baseline means only units that fail NEWLY alert, and long-standing
+# failures baseline silently the first time a host is seen. Hosts the
+# watcher cannot SSH to are coverage gaps (report + log, never a flag).
+
+failed_units_probe() { # $1=ssh host -> raw output; nonzero rc = SSH failed
+  # Remote "|| true" keeps a missing/odd systemctl from masquerading as
+  # an SSH failure: ssh itself exits 255 when it cannot connect.
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$1" \
+    'systemctl --failed --no-legend 2>/dev/null || true' 2>/dev/null
+}
+
+failed_units_parse() { # stdin: systemctl output -> sorted unique unit names
+  sed -E 's/^[^a-zA-Z0-9_@.:-]+//' | awk '{print $1}' \
+    | grep -E '\.(service|mount|timer|socket|target|path|slice|scope|device|swap|automount)$' \
+    | sort -u
+}
+
+failed_units_eval() { # $1=ssh host $2=current failed units (newline list)
+  local host=$1 cur=$2 key known cur_csv new_list="" u
+  key="failed_units_$(state_key_for "$host")"
+  cur_csv=$(printf '%s' "$cur" | paste -sd, -)
+  if ! grep -qE "^$key=" "$STATE_FILE" 2>/dev/null; then
+    state_set "$key" "$cur_csv"
+    REPORT+="[failed-units $host] baseline recorded (failed now: ${cur_csv:-none} — pre-existing, not alerting)"$'\n'
+    log "failed-units $host: baseline recorded (${cur_csv:-none})"
+    return 0
+  fi
+  known=$(state_get "$key"); known=${known:-}
+  for u in $cur; do
+    case ",$known," in *",$u,"*) ;; *) new_list+="$u " ;; esac
+  done
+  state_set "$key" "$cur_csv"
+  new_list=$(printf '%s' "$new_list" | sed -e 's/ *$//')
+  if [ -n "$new_list" ]; then
+    FLAGS+=("warn:failed_new:$host newly failed systemd unit(s): $new_list")
+  fi
+  REPORT+="[failed-units $host] failed now: ${cur_csv:-none} | new: ${new_list:-none}"$'\n'
+}
+
+check_failed_units() {
+  [ -z "$FAILED_UNIT_HOSTS" ] && return 0
+  local now last host out units
+  now=$(date +%s)
+  last=$(state_get failed_units_last_run); last=${last:-0}
+  if [ $(( now - last )) -lt $(( FAILED_UNITS_INTERVAL_H * 3600 )) ]; then
+    REPORT+="[failed-units] daily check not due (last run $(( (now - last) / 3600 ))h ago)"$'\n'
+    return 0
+  fi
+  state_set failed_units_last_run "$now"
+  for host in $FAILED_UNIT_HOSTS; do
+    if out=$(failed_units_probe "$host"); then
+      units=$(printf '%s' "$out" | failed_units_parse)
+      failed_units_eval "$host" "$units"
+    else
+      REPORT+="[failed-units $host] SSH FAILED — cannot check (coverage gap)"$'\n'
+      log "failed-units $host: ssh failed (coverage gap)"
+    fi
+  done
+}
+
+# -- usenetFetch stall (Vostro) -------------------------------------------
+# usenetFetch only runs during catch-ups, so "not running" is the normal
+# state and stays silent. A stall needs every sign of life frozen at
+# once, sampled identically across runs for USENET_STALL_MIN minutes:
+# pending-release count (SELECT COUNT(*) FROM pending_releases — the
+# queue table the tool itself drains), newest mtime of the state DB or
+# its WAL (the DB runs in WAL mode, so recent writes land in the -wal
+# file first), and the process's cumulative CPU time. Slow-but-alive
+# always moves at least one of the three.
+# The probe is split into two SSH calls on purpose: the process call
+# must not contain a plain "usenet-fetch" anywhere else in its command
+# line, or the remote shell running the probe matches its own pgrep.
+
+USENET_PROBE_PCPU='pids=$(pgrep -f "[u]senet-fetch" || true); if [ -z "$pids" ]; then echo running=0; else echo running=1; c=0; for p in $pids; do t=$(ps -o times= -p "$p" 2>/dev/null | tr -d " "); c=$((c + ${t:-0})); done; echo "cpu=$c"; fi'
+
+USENET_PROBE_DB='d="$HOME/usenetFetch"; m1=$(stat -c %Y "$d/usenet-fetch.db" 2>/dev/null || echo 0); m2=$(stat -c %Y "$d/usenet-fetch.db-wal" 2>/dev/null || echo 0); if [ "$m2" -gt "$m1" ]; then m=$m2; else m=$m1; fi; echo "mtime=$m"; p=$(timeout 60 sqlite3 "file:$d/usenet-fetch.db?mode=ro" "SELECT COUNT(*) FROM pending_releases;" 2>/dev/null || echo -1); echo "pending=$p"'
+
+usenet_probe() { # $1=ssh host -> key=value lines; nonzero rc = unreachable
+  local host=$1 a b
+  a=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" "$USENET_PROBE_PCPU" 2>/dev/null) || return 1
+  b=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" "$USENET_PROBE_DB" 2>/dev/null) || return 1
+  printf '%s\n%s\n' "$a" "$b"
+}
+
+usenet_eval() { # $1=probe key=value lines $2=now (epoch)
+  local out=$1 now=$2 running pending cpu mtime sample prev prev_time idle_min
+  running=$(printf '%s' "$out" | sed -n 's/^running=//p' | head -1)
+  pending=$(printf '%s' "$out" | sed -n 's/^pending=//p' | head -1)
+  cpu=$(printf '%s' "$out" | sed -n 's/^cpu=//p' | head -1)
+  mtime=$(printf '%s' "$out" | sed -n 's/^mtime=//p' | head -1)
+  if [ "${running:-0}" != "1" ]; then
+    state_set usenet_sample ""
+    state_set usenet_sample_time 0
+    REPORT+="[usenet] usenetFetch not running on $USENET_HOST (normal — stall check silent)"$'\n'
+    return 0
+  fi
+  case "${pending:-}" in
+    ''|*[!0-9-]*|-1)
+      REPORT+="[usenet] usenetFetch running on $USENET_HOST but pending count unavailable — stall check skipped"$'\n'
+      return 0
+      ;;
+  esac
+  if [ "$pending" -le 0 ]; then
+    state_set usenet_sample ""
+    state_set usenet_sample_time 0
+    REPORT+="[usenet] usenetFetch running on $USENET_HOST, pending=0 (nothing waiting — stall check silent)"$'\n'
+    return 0
+  fi
+  sample="${pending}|${cpu:-0}|${mtime:-0}"
+  prev=$(state_get usenet_sample); prev=${prev:-}
+  prev_time=$(state_get usenet_sample_time); prev_time=${prev_time:-0}
+  if [ "$sample" != "$prev" ]; then
+    state_set usenet_sample "$sample"
+    state_set usenet_sample_time "$now"
+    REPORT+="[usenet] usenetFetch alive on $USENET_HOST: pending=$pending, signs of life current"$'\n'
+    return 0
+  fi
+  idle_min=$(( (now - prev_time) / 60 ))
+  REPORT+="[usenet] usenetFetch on $USENET_HOST: pending=$pending unchanged for ${idle_min}m"$'\n'
+  if [ "$idle_min" -ge "$USENET_STALL_MIN" ]; then
+    FLAGS+=("warn:usenet_stall:$USENET_HOST usenetFetch appears stalled: process running, $pending releases pending, but no DB writes, no CPU progress and no queue change for ${idle_min}m")
+  fi
+}
+
+check_usenet_stall() {
+  [ -z "$USENET_HOST" ] && return 0
+  local out now
+  now=$(date +%s)
+  if out=$(usenet_probe "$USENET_HOST"); then
+    usenet_eval "$out" "$now"
+  else
+    REPORT+="[usenet] cannot probe $USENET_HOST over SSH (coverage gap)"$'\n'
+    log "usenet: ssh probe to $USENET_HOST failed (coverage gap)"
+  fi
+}
+
 call_model() { # $1=scoped group input file; prints model response
   python3 - "$PROMPT_FILE" "$1" "$MODEL" "$OLLAMA_HOST" <<'PYEOF' 2>"$STATE_DIR/triage_err.txt"
 import json, sys, urllib.request
@@ -511,6 +847,10 @@ hint_for() { # $1=kind $2=mount (disk groups) -> one code-chosen READ-ONLY check
     oom) printf 'Check: dmesg | grep -i "killed process" to see what was killed' ;;
     clock) printf 'Check: timedatectl; systemctl status systemd-timesyncd' ;;
     duel_stuck|duel_idle) printf 'Check: tail the newest log in ~/dual/output/logs' ;;
+    filelist) printf 'Check: curl -sI http://<host>:8081/ for the web side; on the Vostro, ps aux | grep job_worker for the worker' ;;
+    miner_down) printf 'Check: ping the miner, then curl -s http://<ip>/swarm to see whether it answers at all' ;;
+    failed_new) printf 'Check: systemctl status <unit> on the host, then journalctl -u <unit> -n 50' ;;
+    usenet_stall) printf 'Check: on the Vostro, ps aux | grep usenet-fetch and tail ~/usenetFetch/daily_log.txt' ;;
     peer_silent|peer_stale) printf 'Check: ssh to the peer and tail ~/.fleet-watch/fleet-watch.log' ;;
     unreachable) printf 'Check: ping the host, then ssh -v to find the failure point' ;;
     reboot_required) printf 'Note: reboot when convenient to finish pending updates' ;;
@@ -609,6 +949,10 @@ for h in $FLEET_HOSTS; do
 done
 check_duels
 peer_check
+check_filelist
+check_miners
+check_failed_units
+check_usenet_stall
 
 echo "$REPORT" > "$REPORT_FILE"
 # Full results in the log: this is the "what was checked" record.

@@ -42,5 +42,21 @@ OLLAMA_HOST="http://localhost:11434"
 # a fleet box like a sim server never runs Ollama).
 #OLLAMA_HOSTS=""
 
+# --- Expansion checks (2026-11-02). Empty list/string disables a check.
+# fileList web UIs (healthy = ANY HTTP answer; 302 to login is normal),
+# plus the job worker process on FILELIST_WORKER_HOST.
+FILELIST_HOSTS="192.168.1.119 192.168.1.118 192.168.1.103 192.168.1.248"
+FILELIST_PORT=8081
+FILELIST_WORKER_HOST="paul@192.168.1.119"
+# NerdMiners (drop-out alerts only for miners seen before).
+MINER_IPS="192.168.1.125 192.168.1.154 192.168.1.188 192.168.1.190"
+# Daily newly-failed systemd units. Hosts this box cannot SSH to are
+# reported as coverage gaps, never alerts.
+FAILED_UNIT_HOSTS="paul@192.168.1.236 paul@192.168.1.119 paul@192.168.1.118 paul@192.168.1.103 paul@192.168.1.248 paul@192.168.1.185 paul@192.168.1.165 paul@192.168.1.179"
+FAILED_UNITS_INTERVAL_H=23
+# usenetFetch stall watch (silent whenever usenetFetch is not running).
+USENET_HOST="paul@192.168.1.119"
+USENET_STALL_MIN=60
+
 # Set to 1 for a test run: prints what WOULD be sent, sends nothing.
 DRY_RUN=0

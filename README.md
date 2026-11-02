@@ -34,6 +34,23 @@ Every run (cron, every 10 minutes):
 5. **Disk detail**: when a mount crosses the warn/crit threshold, the
    run collects the largest entries on that mount, and the disk group's
    triage call sees only that mount's entries.
+6. **Expansion checks** (config-driven; an empty list disables one):
+   - **fileList health** — every fileList web UI must return an HTTP
+     answer (its normal answer is a 302 login redirect), and on the
+     Vostro the job-worker process must be alive: a dead worker strands
+     queued jobs silently while the UI looks fine.
+   - **NerdMiner drop-off** — swarm membership is the union of every
+     miner's `/swarm` device list; a miner that was seen and drops out
+     alerts (debounced), one that was never seen never does.
+   - **Newly failed systemd units, daily** — per-host baselines mean
+     only units that fail *newly* alert; pre-existing failures baseline
+     silently. Hosts the watcher cannot SSH to are coverage gaps in the
+     report, not alerts.
+   - **usenetFetch stall** — only armed while the process runs (not
+     running is its normal state): releases pending plus state-DB
+     mtime, process CPU time, and pending count *all* frozen for
+     `USENET_STALL_MIN` minutes (default 60) means stalled. Slow but
+     alive always moves one of the three.
 
 ## Coexistence with duels
 
