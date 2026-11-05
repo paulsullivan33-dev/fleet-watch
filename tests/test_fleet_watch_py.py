@@ -34,6 +34,14 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(fw.cfg_int(w.cfg, "DISK_CRIT"), 95)
 
 
+class RunnerTests(unittest.TestCase):
+    def test_run_merges_stderr_and_returns_rc(self):
+        rc, out = fw.Watcher.run(["bash", "-c", "echo out; echo err >&2; exit 3"])
+        self.assertEqual(rc, 3)
+        self.assertIn("out", out)
+        self.assertIn("err", out)
+
+
 class WorstSevTests(unittest.TestCase):
     def test_crit_wins_regardless_of_order(self):
         for flags in itertools.permutations(

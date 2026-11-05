@@ -251,7 +251,7 @@ class Watcher:
         """Run a command list, merging stderr into stdout (bash 2>&1).
         Returns (rc, text). rc=124-style failures surface as rc!=0."""
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True,
                                timeout=timeout, stderr=subprocess.STDOUT)
             return r.returncode, r.stdout or ""
         except subprocess.TimeoutExpired as e:
