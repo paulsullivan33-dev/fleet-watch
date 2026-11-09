@@ -1,0 +1,14 @@
+# FINDINGS (only these — one host, one filesystem)
+- self(ArduinoQ) / at 96%
+# HOST SUMMARY
+- self(ArduinoQ): 19:40:01 up 14 days,  3:33,  1 user,  load average: 0.21, 0.05, 0.01 | worst disk: 96% (/) | mem: 3036M avail | ollama: api_http=200
+# DISK DETAIL — largest entries on / ONLY
+== topdirs /
+4.7G	//usr
+1.2G	//var
+960M	//home
+163M	//boot
+14M	//opt
+6.3M	//etc
+1.7M	//run
+368K	//tmp

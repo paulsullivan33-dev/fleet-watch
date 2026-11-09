@@ -1,0 +1,4 @@
+# FINDINGS (only these — one host)
+- paul@192.168.1.248 has a pending reboot
+# HOST SUMMARY
+- paul@192.168.1.248: 16:30:04 up 1 day,  3:02,  3 users,  load average: 0.67, 2.23, 2.12 | worst disk: 14% (/) | mem: 6629M avail | ollama: api_http=200 | reboot-required

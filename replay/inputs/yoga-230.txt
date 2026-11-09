@@ -1,0 +1,4 @@
+# FINDINGS (only these — one host)
+- paul@192.168.1.230 shows OOM-killed processes in dmesg (last 24h)
+# HOST SUMMARY
+- paul@192.168.1.230: 11:23:47 up 1 day,  3:52,  2 users,  load average: 0.07, 0.02, 0.01 | worst disk: 12% (/) | mem: 10607M avail | ollama: api_http=200

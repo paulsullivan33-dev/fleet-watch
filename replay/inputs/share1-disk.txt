@@ -1,0 +1,14 @@
+# FINDINGS (only these — one host, one filesystem)
+- paul@192.168.1.119 /myData/share1 at 85%
+# HOST SUMMARY
+- paul@192.168.1.119: 20:23:02 up 5 days,  8:35,  1 user,  load average: 0.77, 1.21, 1.53 | worst disk: 85% (/myData/share1) | mem: 13243M avail | ollama: api_http=200
+# DISK DETAIL — largest entries on /myData/share1 ONLY
+== topdirs /myData/share1
+5.8T	/myData/share1/sabnzbd
+5.9G	/myData/share1/calibre-library
+80M	/myData/share1/plexmediaserver_1.42.1.10060-4e8b05daf_amd64.deb
+78M	/myData/share1/nomachine_9.1.24_6_amd64.deb
+5.8M	/myData/share1/2025_MandateForLeadership_FULL.pdf
+5.0M	/myData/share1/fastfetch-linux-amd64.deb
+16K	/myData/share1/lost+found
+4.0K	/myData/share1/links.txt

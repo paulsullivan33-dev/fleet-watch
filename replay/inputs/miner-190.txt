@@ -1,0 +1,4 @@
+# FINDINGS (only these — one host)
+- 192.168.1.190 NerdMiner has dropped out of the swarm (absent 2+ consecutive checks)
+# HOST SUMMARY
+- 192.168.1.190: NerdMiner missing from swarm

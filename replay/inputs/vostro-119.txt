@@ -1,0 +1,4 @@
+# FINDINGS (only these — one host)
+- paul@192.168.1.119 has 1 failed systemd service(s): udisks2.service
+# HOST SUMMARY
+- paul@192.168.1.119: 12:30:02 up 42 min,  0 users,  load average: 1.72, 1.81, 1.86 | worst disk: 83% (/myData/share1) | mem: 13924M avail | ollama: api_http=200 | failed_svc:1(udisks2.service)
