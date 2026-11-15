@@ -1,0 +1,5 @@
+
+ssh paul@192.168.1.109 'sed -i "/^last_alert_hash=/d; /^last_alert_time=/d" ~/.fleet-watch/state'
+ssh paul@192.168.1.171 'sed -i "/^last_alert_hash=/d; /^last_alert_time=/d" ~/.fleet-watch/state'
+
+
