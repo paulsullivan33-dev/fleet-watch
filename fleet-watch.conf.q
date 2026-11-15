@@ -60,3 +60,17 @@ USENET_STALL_MIN=60
 
 # Set to 1 for a test run: prints what WOULD be sent, sends nothing.
 DRY_RUN=0
+
+# --- 2026-11-15: service checks and ~/MACHINES host coverage -------------
+# Empty disables each one.
+DXTICKER_HEALTH_URL="http://192.168.1.119:8086/health"
+DXTICKER_STALE_SEC=1800
+UPSTREAM_HOST="paul@192.168.1.119"
+UPSTREAM_MAX_AGE_H=5
+# Host list fetched daily from the Vostro and cached locally. Self and
+# PEER_HOST are skipped automatically; add anything else to HOST_EXCLUDE.
+MACHINES_SOURCE="paul@192.168.1.119:~/MACHINES"
+MACHINES_REFRESH_H=24
+HOST_EXCLUDE=""
+# Total seconds of model calls per run (keeps runs under cron's 540 s).
+TRIAGE_BUDGET_SEC=240
