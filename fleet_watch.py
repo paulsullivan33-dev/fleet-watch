@@ -16,6 +16,15 @@ triage-prompt.txt as the bash version. Behavior mirrors the bash watcher:
      only writes prose. Clean runs make no model call.
   6. ntfy alerts only on state changes (6h same-issue suppression),
      plus a "recovered" note and a daily alive ping.
+  7. Service checks (2026-11-15, config-driven, empty disables): the
+     dxticker /health endpoint and upstream's timer/last-run result.
+     Their alert text is script-owned; no model call for these groups.
+  8. Host coverage from ~/MACHINES (2026-11-15, optional): the Vostro's
+     host list is fetched over SSH at most every MACHINES_REFRESH_H and
+     cached locally, so a Vostro outage never blinds the watcher. Full
+     checks run on FLEET_HOSTS + MACHINES hosts, minus self, the peer
+     and HOST_EXCLUDE. A host the watcher cannot LOG IN to (host key /
+     key auth) is a coverage warning, not "host down".
 
 Differences from the bash version, by design:
   * OOM kills are remembered per host (newest reported kernel timestamp
@@ -73,6 +82,20 @@ DEFAULTS = {
     "FAILED_UNITS_INTERVAL_H": "23",
     "USENET_HOST": "paul@192.168.1.119",
     "USENET_STALL_MIN": "60",
+    # Service checks (empty disables each).
+    "DXTICKER_HEALTH_URL": "",
+    "DXTICKER_STALE_SEC": "1800",
+    "UPSTREAM_HOST": "",
+    "UPSTREAM_MAX_AGE_H": "5",
+    # Host coverage from the Vostro's ~/MACHINES (empty disables).
+    # Form: ssh-target:path, e.g. paul@192.168.1.119:~/MACHINES
+    "MACHINES_SOURCE": "",
+    "MACHINES_REFRESH_H": "24",
+    "HOST_EXCLUDE": "",
+    # Total seconds the model calls of one run may use; the rest of the
+    # groups go out as raw findings. Keeps a run inside cron's 540 s even
+    # when the triage box is busy and more hosts mean more issue groups.
+    "TRIAGE_BUDGET_SEC": "240",
 }
 
 
@@ -441,9 +464,35 @@ def ollama_expected(w, host):
     return host in hosts.split()
 
 
+LOGIN_REFUSED_MARKERS = (
+    "Host key verification failed",
+    "Permission denied (publickey",
+    "REMOTE HOST IDENTIFICATION HAS CHANGED",
+    "No ED25519 host key is known",
+    "No ECDSA host key is known",
+    "No RSA host key is known",
+)
+
+
+def login_refused(out):
+    text = out or ""
+    return any(m in text for m in LOGIN_REFUSED_MARKERS)
+
+
 def check_host(w, host, label, now=None):
     now = now or int(time.time())
     rc, out = run_probe(w, host)
+    if rc != 0 and login_refused(out):
+        # The host answered but refused this watcher: a coverage gap to
+        # fix once (ssh-copy-id), not an outage. Never CRIT.
+        w.unreach_clear(label)
+        w.report.append(f"[{label}] LOGIN REFUSED (host key or key auth)")
+        w.triage_summary.append(
+            f"- {label}: watcher cannot log in (host key or key auth)")
+        w.flags.append(
+            f"warn:coverage:{label} fleet-watch on {w.hostname} cannot log "
+            "in (host key or key auth); not checked")
+        return
     if rc != 0 or not out:
         w.report.append(f"[{label}] UNREACHABLE")
         if w.unreach_should_flag(label):
@@ -911,6 +960,196 @@ def check_usenet_stall(w, now=None):
         w.log(f"usenet: ssh probe to {host} failed (coverage gap)")
 
 
+# -------------------------------------------------------- service checks
+
+def dxticker_fetch(w, url):
+    """Return the parsed /health JSON, or None if unreachable/unparseable."""
+    try:
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            return json.load(resp)
+    except Exception:
+        return None
+
+
+def dxticker_eval(w, health, now=None):
+    url = w.cfg.get("DXTICKER_HEALTH_URL", "")
+    if health is None:
+        w.report.append(f"[dxticker] health endpoint NOT answering ({url})")
+        w.triage_summary.append("- dxticker: health endpoint not answering")
+        if w.unreach_should_flag("dxticker"):
+            w.flags.append(
+                f"warn:dxticker:dxticker health endpoint not answering at "
+                f"{url} (2+ consecutive checks)")
+        else:
+            w.log("dxticker: first consecutive miss (debounced)")
+        return
+    w.unreach_clear("dxticker")
+    version = health.get("version", "?")
+    connected = bool(health.get("mqtt_connected"))
+    age = health.get("last_msg_age_s")
+    stale = cfg_int(w.cfg, "DXTICKER_STALE_SEC")
+    problems = []
+    if not connected:
+        problems.append("MQTT disconnected")
+    if age is None or (isinstance(age, (int, float)) and age > stale):
+        mins = int(age // 60) if isinstance(age, (int, float)) else None
+        problems.append(f"no spots for {mins}m" if mins is not None
+                        else "no spots received since start")
+    w.report.append(
+        f"[dxticker] version {version}, mqtt_connected={connected}, "
+        f"last_msg_age_s={age}")
+    if not problems:
+        w.unreach_clear("dxticker-feed")
+        w.triage_summary.append(f"- dxticker: OK (v{version})")
+        return
+    text = ", ".join(problems)
+    w.triage_summary.append(f"- dxticker: {text}")
+    if w.unreach_should_flag("dxticker-feed"):
+        w.flags.append(f"warn:dxticker:dxticker {text} (2+ consecutive checks)")
+    else:
+        w.log(f"dxticker: {text} (first consecutive check, debounced)")
+
+
+def check_dxticker(w, now=None):
+    url = w.cfg.get("DXTICKER_HEALTH_URL", "")
+    if not url:
+        return
+    dxticker_eval(w, dxticker_fetch(w, url), now)
+
+
+UPSTREAM_PROBE = (
+    'r=$(systemctl --user show -p Result --value upstream.service 2>/dev/null); '
+    't=$(systemctl --user show -p LastTriggerUSec --value upstream.timer 2>/dev/null); '
+    'e=$(date -d "$t" +%s 2>/dev/null || echo 0); '
+    'echo "result=$r"; echo "last=$e"')
+
+
+def upstream_eval(w, out, now):
+    host = w.cfg.get("UPSTREAM_HOST", "")
+    kv = {}
+    for ln in (out or "").splitlines():
+        if "=" in ln:
+            k, _, v = ln.partition("=")
+            kv[k.strip()] = v.strip()
+    result = kv.get("result", "")
+    last = kv.get("last", "0")
+    last = int(last) if last.isdigit() else 0
+    if not result or last <= 0:
+        w.report.append(
+            f"[upstream] timer/service state unavailable on {host} "
+            f"(result={result or '?'}, last={last})")
+        w.triage_summary.append("- upstream: timer state unavailable")
+        if w.unreach_should_flag("upstream-state"):
+            w.flags.append(
+                "warn:upstream:upstream timer or service not found on "
+                f"{host} (2+ consecutive checks)")
+        return
+    w.unreach_clear("upstream-state")
+    age_h = (now - last) // 3600
+    w.report.append(
+        f"[upstream] last run result={result}, timer last fired {age_h}h ago")
+    problems = []
+    if result != "success":
+        problems.append(f"last run failed (Result={result})")
+    max_h = cfg_int(w.cfg, "UPSTREAM_MAX_AGE_H")
+    if now - last > max_h * 3600:
+        problems.append(f"timer last fired {age_h}h ago (expected every 2h)")
+    if problems:
+        text = "; ".join(problems)
+        w.triage_summary.append(f"- upstream: {text}")
+        w.flags.append(f"warn:upstream:upstream {text}")
+    else:
+        w.triage_summary.append("- upstream: OK")
+
+
+def check_upstream(w, now=None):
+    now = now or int(time.time())
+    host = w.cfg.get("UPSTREAM_HOST", "")
+    if not host:
+        return
+    rc, out = w.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                     host, UPSTREAM_PROBE], timeout=30)
+    if rc != 0:
+        # Reachability of the host itself is check_host's job.
+        w.report.append(f"[upstream] cannot probe {host} over SSH (coverage gap)")
+        w.log(f"upstream: ssh probe to {host} failed (coverage gap)")
+        return
+    upstream_eval(w, out, now)
+
+
+# --------------------------------------------------------- host coverage
+
+def parse_machines(text):
+    hosts = []
+    for ln in (text or "").splitlines():
+        ln = ln.split("#", 1)[0].strip()
+        if ln:
+            tok = ln.split()[0]
+            if tok not in hosts:
+                hosts.append(tok)
+    return hosts
+
+
+def host_part(target):
+    return target.rsplit("@", 1)[-1]
+
+
+def own_addresses(w):
+    rc, out = w.run(["hostname", "-I"], timeout=10)
+    addrs = set((out or "").split()) if rc == 0 else set()
+    return addrs | {"localhost", "127.0.0.1", w.hostname}
+
+
+def machines_hosts(w, now):
+    """Hosts from the cached ~/MACHINES copy, refreshing it when due.
+    Returns [] when disabled or when nothing has ever been fetched."""
+    source = w.cfg.get("MACHINES_SOURCE", "")
+    if not source or ":" not in source:
+        return []
+    cache = os.path.join(w.state_dir, "machines.cache")
+    last = int(w.state.get("machines_refreshed", "0") or 0)
+    if now - last >= cfg_int(w.cfg, "MACHINES_REFRESH_H") * 3600 \
+            or not os.path.exists(cache):
+        src_host, _, path = source.partition(":")
+        rc, out = w.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                         src_host, f"cat {path}"], timeout=30)
+        fetched = parse_machines(out) if rc == 0 else []
+        if fetched:
+            tmp = cache + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(fetched) + "\n")
+            os.replace(tmp, cache)
+            w.state.set("machines_refreshed", now)
+            w.log(f"machines: refreshed {len(fetched)} host(s) from {source}")
+        else:
+            w.log(f"machines: refresh from {source} failed; using cached copy")
+            w.report.append(
+                f"[hosts] MACHINES refresh from {source} failed — using cache")
+    if not os.path.exists(cache):
+        return []
+    with open(cache, encoding="utf-8", errors="replace") as f:
+        return parse_machines(f.read())
+
+
+def fleet_hosts(w, now=None):
+    """FLEET_HOSTS plus cached MACHINES hosts, minus self, peer, HOST_EXCLUDE;
+    de-duplicated by address, FLEET_HOSTS order first."""
+    now = now or int(time.time())
+    peer = w.cfg.get("PEER_HOST", "")
+    exclude = w.cfg.get("HOST_EXCLUDE", "").split()
+    excl_parts = {host_part(e) for e in exclude}
+    skip_parts = {host_part(peer)} | excl_parts
+    mine = own_addresses(w) if w.cfg.get("MACHINES_SOURCE", "") else set()
+    out, seen = [], set()
+    for h in w.cfg.get("FLEET_HOSTS", "").split() + machines_hosts(w, now):
+        part = host_part(h)
+        if h == peer or part in skip_parts or part in mine or part in seen:
+            continue
+        seen.add(part)
+        out.append(h)
+    return out
+
+
 # ---------------------------------------------------------------- triage
 
 def worst_sev(flags):
@@ -1003,6 +1242,9 @@ def hint_for(kind, mount=""):
         "peer_stale": "Check: ssh to the peer and tail ~/.fleet-watch/fleet-watch.log",
         "unreachable": "Check: ping the host, then ssh -v to find the failure point",
         "reboot_required": "Note: reboot when convenient to finish pending updates",
+        "dxticker": "Check: curl -s http://192.168.1.119:8086/health; on the Vostro, journalctl --user -u dxticker -n 30",
+        "upstream": "Check: on the Vostro, systemctl --user status upstream.service upstream.timer; journalctl --user -u upstream -n 30",
+        "coverage": "Check: from this watcher, ssh <host> once to accept its host key, then ssh-copy-id <host>",
     }
     return table.get(kind, "")
 
@@ -1040,7 +1282,17 @@ def build_group_input(w, key):
     return "\n".join(lines) + "\n"
 
 
-def call_model(w, group_file):
+# Deterministic checks whose findings explain themselves: their groups
+# never go to the model (script-owned text plus the read-only hint).
+SCRIPT_ONLY_KINDS = {"dxticker", "upstream", "coverage"}
+
+
+def script_only_group(w, key):
+    flags = group_flags(w.flags, key, w)
+    return bool(flags) and all(flag_kind(f) in SCRIPT_ONLY_KINDS for f in flags)
+
+
+def call_model(w, group_file, timeout=300):
     prompt = ""
     if os.path.exists(w.prompt_file):
         with open(w.prompt_file, encoding="utf-8", errors="replace") as f:
@@ -1059,7 +1311,7 @@ def call_model(w, group_file):
         w.cfg.get("OLLAMA_HOST", "") + "/api/generate", data=body,
         headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.load(resp)["response"]
     except Exception as e:  # degrade to raw flags, like the bash version
         err_path = os.path.join(w.state_dir, "triage_err.txt")
@@ -1083,6 +1335,7 @@ def normalize_dedup_key(key):
     key = re.sub(r"[0-9]+m( old)?", "", key)
     key = re.sub(r"(at|pegged at) [0-9]+%", "", key)
     key = re.sub(r"\(pids [0-9 ]+\)", "", key)
+    key = re.sub(r"[0-9]+h ago", "", key)
     return key
 
 
@@ -1120,10 +1373,9 @@ def run(w):
     now = int(time.time())
 
     check_host(w, "localhost", w.self_label, now)
-    peer = w.cfg.get("PEER_HOST", "")
-    for h in w.cfg.get("FLEET_HOSTS", "").split():
-        if h == peer:
-            continue
+    hosts = fleet_hosts(w, now)
+    w.report.append(f"[hosts] full checks on {len(hosts)}: {' '.join(hosts)}")
+    for h in hosts:
         check_host(w, h, h, now)
     check_duels(w, now)
     peer_check(w, now)
@@ -1131,6 +1383,8 @@ def run(w):
     check_miners(w)
     check_failed_units(w, now)
     check_usenet_stall(w, now)
+    check_dxticker(w, now)
+    check_upstream(w, now)
 
     report_text = "\n".join(w.report) + "\n"
     with open(w.report_file, "w", encoding="utf-8") as f:
@@ -1204,6 +1458,8 @@ def run(w):
                   f"for {len(group_keys)} issue group(s)")
         body = ""
         model_any = False
+        budget_end = time.monotonic() + cfg_int(w.cfg, "TRIAGE_BUDGET_SEC")
+        budget_logged = False
         for key in group_keys:
             g_label = key.split("|", 1)[0]
             g_mount = key.split("|disk|", 1)[1] if "|disk|" in key else ""
@@ -1215,8 +1471,15 @@ def run(w):
                 f.write(g_input)
             w.log_block(f"triage input [{key}]", g_input)
             g_answer = ""
-            if allow_triage:
-                g_answer = call_model(w, g_file)
+            remaining = int(budget_end - time.monotonic())
+            use_model = allow_triage and not script_only_group(w, key)
+            if use_model and remaining < 15:
+                use_model = False
+                if not budget_logged:
+                    w.log("triage budget spent: remaining groups sent as raw findings")
+                    budget_logged = True
+            if use_model:
+                g_answer = call_model(w, g_file, timeout=min(300, remaining))
                 w.log_block(f"triage response [{key}]", g_answer + "\n")
                 if not g_answer:
                     err = ""

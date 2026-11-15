@@ -51,6 +51,31 @@ Every run (cron, every 10 minutes):
      mtime, process CPU time, and pending count *all* frozen for
      `USENET_STALL_MIN` minutes (default 60) means stalled. Slow but
      alive always moves one of the three.
+7. **Service checks** (2026-11-15; config-driven, empty disables):
+   - **dxticker** (`DXTICKER_HEALTH_URL`): the `/health` endpoint must
+     answer, show `mqtt_connected`, and report a spot within
+     `DXTICKER_STALE_SEC` (default 1800). Every problem is debounced over
+     2 runs. dxticker alerts on a stalled feed itself; this check exists
+     for the case it can't report: the process being dead.
+   - **upstream** (`UPSTREAM_HOST`): over SSH, the last run's `Result`
+     must be `success` and the timer must have fired within
+     `UPSTREAM_MAX_AGE_H` (default 5; it runs every 2 h). A single failed
+     run is also caught by upstream's own `OnFailure` hook. This check
+     flags a stuck timer.
+   - These findings are self-explanatory, so their alert text is
+     script-owned: no model call for these groups.
+8. **Host coverage from `~/MACHINES`** (2026-11-15; `MACHINES_SOURCE`,
+   empty disables): the Vostro's host list is fetched over SSH at most
+   every `MACHINES_REFRESH_H` (default 24) and cached in the state dir,
+   so a Vostro outage never blinds the watcher. Full checks run on
+   `FLEET_HOSTS` + `MACHINES`, minus this watcher's own addresses, the
+   peer and `HOST_EXCLUDE`. A host that answers but refuses this
+   watcher's login (unknown host key, key auth) is a WARN coverage
+   finding with the fix in the hint; it's never a CRIT "unreachable".
+9. **Triage time budget** (`TRIAGE_BUDGET_SEC`, default 240): the model
+   calls of one run share this budget. Groups past it go out as raw
+   findings, so a busy triage box can't push a run past cron's 540 s
+   `timeout` and silence the heartbeat. More hosts means more groups.
 
 ## Coexistence with duels
 
