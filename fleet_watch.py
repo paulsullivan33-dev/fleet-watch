@@ -373,7 +373,7 @@ def _section_first(sections, name):
     return lines[0] if lines else ""
 
 
-def triage_host_line(w, label, out):
+def triage_host_line(w, label, out, ollama_mon=True):
     sections = split_sections(out)
     up = _section_first(sections, "uptime")
     up = up.split(" ", 1)[1] if " " in up else up  # strip leading clock time
@@ -388,9 +388,15 @@ def triage_host_line(w, label, out):
         if p and p[0] == "Mem:" and len(p) >= 7:
             mem = f"{p[6]}M avail"
     oll = ""
-    m = re.search(r"api_http=[0-9]+|api=down", out)
-    if m:
-        oll = m.group(0)
+    if ollama_mon:
+        # Only monitored hosts get an Ollama token here. The probe curls
+        # every host's port 11434, so an unmonitored host's raw output
+        # always says api=down; printing that in the summary once led the
+        # triage model to report "Ollama is down" for a host that does
+        # not run Ollama at all (2026-11-16, deb-prox-vm).
+        m = re.search(r"api_http=[0-9]+|api=down", out)
+        if m:
+            oll = m.group(0)
     extra = ""
     n, names = failed_svc_info(out)
     if n > 0:
@@ -510,7 +516,8 @@ def check_host(w, host, label, now=None):
     w.unreach_clear(label)
     w.report.append(f"[{label}]")
     w.report.extend(out.rstrip("\n").splitlines())
-    w.triage_summary.append(triage_host_line(w, label, out))
+    w.triage_summary.append(
+        triage_host_line(w, label, out, ollama_expected(w, host)))
     disk_flags_for(w, label, out)
     oom_check(w, label, out, now)
     sections = split_sections(out)

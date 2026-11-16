@@ -265,5 +265,49 @@ class FilelistEvalTests(unittest.TestCase):
                 w.state.get("unreach_filelist_192_168_1_119"), "0")
 
 
+PROBE_OUT = """== uptime
+ 08:00:01 up 3 days,  2:14,  1 user,  load average: 0.10, 0.08, 0.05
+== df
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda1       100G   44G   56G  44% /
+== mem
+Mem:           8000        1000        6000           0         500        6500
+== ollama
+api=down
+== failedsvc
+bash.service - a transient unit
+== end
+"""
+
+
+class TriageHostLineTests(unittest.TestCase):
+    """The host summary feeds the triage model. For hosts where Ollama
+    is not monitored it must not carry the probe's api=down token —
+    on 2026-11-16 the model promoted that token into an "Ollama is
+    down" claim for deb-prox-vm, which does not run Ollama."""
+
+    def test_unmonitored_host_hides_ollama_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = make_watcher(tmp)
+            line = fw.triage_host_line(
+                w, "paul@192.168.1.85", PROBE_OUT, ollama_mon=False)
+            self.assertIn("ollama: n/a", line)
+            self.assertNotIn("api=down", line)
+            self.assertIn("failed_svc:1(bash.service)", line)
+
+    def test_monitored_host_keeps_ollama_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = make_watcher(tmp)
+            line = fw.triage_host_line(
+                w, "paul@192.168.1.236", PROBE_OUT, ollama_mon=True)
+            self.assertIn("ollama: api=down", line)
+
+    def test_default_keeps_ollama_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = make_watcher(tmp)
+            line = fw.triage_host_line(w, "paul@192.168.1.236", PROBE_OUT)
+            self.assertIn("ollama: api=down", line)
+
+
 if __name__ == "__main__":
     unittest.main()
