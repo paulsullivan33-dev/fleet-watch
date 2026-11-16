@@ -180,6 +180,13 @@ done
         self.assertNotIn('SUGGESTION:', PROMPT)
         self.assertIn('no suggestions', PROMPT)
 
+    def test_prompt_scopes_service_claims_to_findings(self):
+        # v3: a service may be reported down only when a finding says
+        # so — the 2026-11-16 alert claimed Ollama down on a host that
+        # does not run it, from the host summary's raw probe token.
+        self.assertIn('never say Ollama is down unless a finding says so',
+                      PROMPT)
+
     def test_unreachable_debounce(self):
         with tempfile.TemporaryDirectory() as td:
             state_file = str(Path(td) / 'state')
