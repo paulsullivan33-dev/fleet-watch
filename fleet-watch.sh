@@ -80,7 +80,7 @@ OOM_WINDOW_SEC=$(( OOM_WINDOW_HOURS * 3600 ))
 # Expansion checks (2026-11-02). Empty list/string disables the check.
 # fileList web UIs (bare IPs; the app is healthy when it returns ANY HTTP
 # status — its normal answer is a 302 redirect to the login page).
-: "${FILELIST_HOSTS:=192.168.1.119 192.168.1.118 192.168.1.103 192.168.1.248}"
+: "${FILELIST_HOSTS:=192.168.1.119 192.168.1.118 192.168.1.92 192.168.1.248}"
 : "${FILELIST_PORT:=8081}"
 # SSH target whose fileList job worker (job_worker.py) is also checked;
 # matched against FILELIST_HOSTS by the part after "@". Empty = web only.
@@ -91,7 +91,7 @@ OOM_WINDOW_SEC=$(( OOM_WINDOW_HOURS * 3600 ))
 # Daily newly-failed-systemd-units check (SSH targets as SSH understands
 # them). Hosts the watcher cannot reach are noted as coverage gaps in the
 # report; they never alert.
-: "${FAILED_UNIT_HOSTS:=paul@192.168.1.236 paul@192.168.1.119 paul@192.168.1.118 paul@192.168.1.103 paul@192.168.1.248 paul@192.168.1.185 paul@192.168.1.165 paul@192.168.1.179}"
+: "${FAILED_UNIT_HOSTS:=paul@192.168.1.236 paul@192.168.1.119 paul@192.168.1.118 paul@192.168.1.92 paul@192.168.1.248 paul@192.168.1.185 paul@192.168.1.165 paul@192.168.1.179}"
 : "${FAILED_UNITS_INTERVAL_H:=23}"
 # usenetFetch stall check: SSH target of the box running it, and how long
 # every sign of life must stay frozen before it counts as stalled.
