@@ -25,6 +25,12 @@ triage-prompt.txt as the bash version. Behavior mirrors the bash watcher:
      checks run on FLEET_HOSTS + MACHINES hosts, minus self, the peer
      and HOST_EXCLUDE. A host the watcher cannot LOG IN to (host key /
      key auth) is a coverage warning, not "host down".
+  9. Alerts append a "Raw evidence" block under each issue group: the
+     verbatim probe/report lines behind the finding, capped per source
+     and in total so the block fits the ntfy body limit alongside the
+     triage prose (2026-11-17 — the alert prose once reported a failed
+     "bash service" that was really a curl error line in the probe
+     output; the raw line would have given it away at a glance).
 
 Differences from the bash version, by design:
   * OOM kills are remembered per host (newest reported kernel timestamp
@@ -210,6 +216,7 @@ class Watcher:
         self.report = []           # report lines
         self.triage_summary = []   # one-liner per host/check
         self.detail_by_host = {}   # label -> deep-disk text
+        self.probe_by_label = {}   # label -> raw probe output (alert evidence)
         self.oom_window_sec = cfg_int(self.cfg, "OOM_WINDOW_HOURS") * 3600
 
     # -- logging ------------------------------------------------------
@@ -488,6 +495,9 @@ def login_refused(out):
 def check_host(w, host, label, now=None):
     now = now or int(time.time())
     rc, out = run_probe(w, host)
+    # Kept verbatim so a later alert can show the raw lines behind any
+    # finding for this host (see render_evidence).
+    w.probe_by_label[label] = out or ""
     if rc != 0 and login_refused(out):
         # The host answered but refused this watcher: a coverage gap to
         # fix once (ssh-copy-id), not an outage. Never CRIT.
@@ -1289,6 +1299,134 @@ def build_group_input(w, key):
     return "\n".join(lines) + "\n"
 
 
+# ------------------------------------------------------- raw evidence
+# Alerts carry the verbatim probe/report lines behind each finding, so
+# the reader never has to take the triage prose on faith. Motivating
+# case (2026-11-17): on a host without curl, the probe's Ollama check
+# emitted "bash: line 1: curl: command not found" on stderr; the line
+# landed in the failedsvc section, was parsed as a failed service named
+# "bash:", and the alert prose reported a nonexistent bash service. Had
+# the alert shown the raw section, the artifact was obvious at a glance.
+
+# Flag kind -> probe section(s) whose lines produced the finding.
+EVIDENCE_SECTIONS = {
+    "disk": ("df",),
+    "inodes": ("inodes",),
+    "failedsvc": ("failedsvc",),
+    "reboot_required": ("rebootreq",),
+    "smart": ("smart",),
+    "readonly": ("ro",),
+    "dmesg": ("dmesg",),
+    "clock": ("clock",),
+    "temp": ("temp",),
+    "ollama_down": ("ollama",),
+    "oom": ("oom",),
+}
+
+# Flag kind -> prefix of the w.report lines that record the check.
+EVIDENCE_REPORT_PREFIX = {
+    "duel_stuck": "[duels]",
+    "duel_idle": "[duels]",
+    "peer_silent": "[peer ",
+    "peer_stale": "[peer ",
+    "failed_new": "[failed-units {label}]",
+    "filelist": "[filelist {label}]",
+    "miner_down": "[miners]",
+    "usenet_stall": "[usenet]",
+    "dxticker": "[dxticker]",
+    "upstream": "[upstream]",
+}
+
+# Size discipline: alerts go out over ntfy.sh (~4 KB body). The raw
+# block is capped per source and in total; the triage prose is composed
+# first and never trimmed to make room — when something gives, raw gives.
+EVIDENCE_LINES_PER_SOURCE = 8
+EVIDENCE_CHARS_PER_SOURCE = 400
+EVIDENCE_BUDGET_CHARS = 1200
+EVIDENCE_TRUNCATED = "… (raw truncated)"
+
+
+def evidence_sources_for(w, key):
+    """[(source_name, [raw lines])] behind one issue group's findings,
+    in flag order, de-duplicated. Lines are verbatim and unedited."""
+    label = key.split("|", 1)[0]
+    mount = key.split("|disk|", 1)[1] if "|disk|" in key else ""
+    sources = []
+    seen = set()
+
+    def add(source, lines):
+        lines = [ln for ln in lines if ln.strip()]
+        sig = (source, tuple(lines))
+        if lines and sig not in seen:
+            seen.add(sig)
+            sources.append((source, lines))
+
+    sections = None
+    for flag in group_flags(w.flags, key, w):
+        kind = flag_kind(flag)
+        if kind in EVIDENCE_SECTIONS:
+            if sections is None:
+                sections = split_sections(w.probe_by_label.get(label, ""))
+            for sec in EVIDENCE_SECTIONS[kind]:
+                lines = sections.get(sec, [])
+                if kind == "disk" and mount:
+                    own = [ln for ln in lines
+                           if ln.split() and ln.split()[-1] == mount]
+                    if own:
+                        lines = own
+                add(sec, lines)
+        elif kind in ("unreachable", "coverage"):
+            # No probe sections exist: the ssh output itself (connect
+            # or auth error text) is the evidence.
+            add("ssh output",
+                (w.probe_by_label.get(label, "") or "").splitlines())
+        elif kind in EVIDENCE_REPORT_PREFIX:
+            prefix = EVIDENCE_REPORT_PREFIX[kind].format(label=label)
+            add(kind, [ln for ln in w.report if ln.startswith(prefix)])
+    return sources
+
+
+def _cap_evidence_lines(lines):
+    """(kept, truncated) under the per-source caps. The first line is
+    always kept whole — verbatim beats the char cap for a single line;
+    the alert-wide budget still bounds the total."""
+    kept, used = [], 0
+    for ln in lines:
+        if kept and (len(kept) >= EVIDENCE_LINES_PER_SOURCE
+                     or used + len(ln) + 1 > EVIDENCE_CHARS_PER_SOURCE):
+            return kept, True
+        kept.append(ln)
+        used += len(ln) + 1
+    return kept, False
+
+
+def render_evidence(w, key, budget):
+    """The 'Raw evidence:' block for one issue group, or '' when the
+    group has no retained raw lines. budget is a one-element list with
+    the chars left for this alert's raw blocks, shared across groups."""
+    blocks = evidence_sources_for(w, key)
+    if not blocks:
+        return ""
+    out = ["Raw evidence:"]
+    truncated = False
+    for source, lines in blocks:
+        kept, cut = _cap_evidence_lines(lines)
+        truncated = truncated or cut
+        block = [f"[{source}]"] + kept
+        cost = sum(len(ln) + 1 for ln in block)
+        if cost > budget[0]:
+            truncated = True
+            break
+        out.extend(block)
+        budget[0] -= cost
+    if len(out) == 1:
+        # Sources exist but nothing fit what is left of the budget.
+        return f"Raw evidence:\n{EVIDENCE_TRUNCATED}\n"
+    if truncated:
+        out.append(EVIDENCE_TRUNCATED)
+    return "\n".join(out) + "\n"
+
+
 # Deterministic checks whose findings explain themselves: their groups
 # never go to the model (script-owned text plus the read-only hint).
 SCRIPT_ONLY_KINDS = {"dxticker", "upstream", "coverage"}
@@ -1465,6 +1603,7 @@ def run(w):
                   f"for {len(group_keys)} issue group(s)")
         body = ""
         model_any = False
+        ev_budget = [EVIDENCE_BUDGET_CHARS]
         budget_end = time.monotonic() + cfg_int(w.cfg, "TRIAGE_BUDGET_SEC")
         budget_logged = False
         for key in group_keys:
@@ -1507,6 +1646,7 @@ def run(w):
             hint = group_hint(w, key)
             if hint:
                 body += hint + "\n"
+            body += render_evidence(w, key, ev_budget)
         if model_any:
             full = f"fleet-watch {sev} — per-issue triage:\n" + body
         else:
