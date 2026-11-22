@@ -755,8 +755,10 @@ def filelist_eval(w, ip, code, worker):
             f"{w.cfg.get('FILELIST_WORKER_HOST', '')} failed)")
 
 
-def check_filelist(w):
-    hosts = w.cfg.get("FILELIST_HOSTS", "").split()
+def check_filelist(w, now=None):
+    now = now or int(time.time())
+    hosts = enforce_machines(
+        w, w.cfg.get("FILELIST_HOSTS", "").split(), now, "FILELIST_HOSTS")
     if not hosts:
         return
     worker_host = w.cfg.get("FILELIST_WORKER_HOST", "")
@@ -873,7 +875,9 @@ def failed_units_eval(w, host, cur_units):
 
 def check_failed_units(w, now=None):
     now = now or int(time.time())
-    hosts = w.cfg.get("FAILED_UNIT_HOSTS", "").split()
+    hosts = enforce_machines(
+        w, w.cfg.get("FAILED_UNIT_HOSTS", "").split(), now,
+        "FAILED_UNIT_HOSTS")
     if not hosts:
         return
     last = int(w.state.get("failed_units_last_run", "0") or 0)
@@ -1148,9 +1152,47 @@ def machines_hosts(w, now):
         return parse_machines(f.read())
 
 
+def machines_roster(w, now):
+    """machines_hosts(), memoized for one `now`: several checks consult
+    the roster per run, and a failed refresh must be attempted (and
+    reported) at most once per run, not once per check."""
+    memo = getattr(w, "_machines_roster", None)
+    if memo is not None and memo[0] == now:
+        return memo[1]
+    roster = machines_hosts(w, now)
+    w._machines_roster = (now, roster)
+    return roster
+
+
+def enforce_machines(w, hosts, now, what):
+    """MACHINES is the source of truth for which machines exist (Paul,
+    2026-11-21): a conf host list may only name machines that are in
+    MACHINES. An entry pointing anywhere else is stale — the machine
+    was retired or the address reused — so it is skipped, and the skip
+    is logged and reported rather than silently probed run after run.
+    When no MACHINES roster is available (disabled, or never fetched)
+    the list passes through untouched: no answer is not an empty
+    roster. localhost is always allowed."""
+    roster = machines_roster(w, now)
+    if not roster:
+        return hosts
+    allowed = {host_part(h) for h in roster} | {"localhost", "127.0.0.1"}
+    kept = []
+    for h in hosts:
+        if host_part(h) in allowed:
+            kept.append(h)
+        else:
+            w.log(f"hosts: {h} in {what} is not in MACHINES — skipped "
+                  f"(MACHINES is the source of truth)")
+            w.report.append(
+                f"[hosts] {h} in {what} is not in MACHINES — skipped")
+    return kept
+
+
 def fleet_hosts(w, now=None):
     """FLEET_HOSTS plus cached MACHINES hosts, minus self, peer, HOST_EXCLUDE;
-    de-duplicated by address, FLEET_HOSTS order first."""
+    de-duplicated by address, FLEET_HOSTS order first. FLEET_HOSTS entries
+    that are not in MACHINES are dropped (see enforce_machines)."""
     now = now or int(time.time())
     peer = w.cfg.get("PEER_HOST", "")
     exclude = w.cfg.get("HOST_EXCLUDE", "").split()
@@ -1158,7 +1200,9 @@ def fleet_hosts(w, now=None):
     skip_parts = {host_part(peer)} | excl_parts
     mine = own_addresses(w) if w.cfg.get("MACHINES_SOURCE", "") else set()
     out, seen = [], set()
-    for h in w.cfg.get("FLEET_HOSTS", "").split() + machines_hosts(w, now):
+    conf_hosts = enforce_machines(
+        w, w.cfg.get("FLEET_HOSTS", "").split(), now, "FLEET_HOSTS")
+    for h in conf_hosts + machines_roster(w, now):
         part = host_part(h)
         if h == peer or part in skip_parts or part in mine or part in seen:
             continue
@@ -1524,7 +1568,7 @@ def run(w):
         check_host(w, h, h, now)
     check_duels(w, now)
     peer_check(w, now)
-    check_filelist(w)
+    check_filelist(w, now)
     check_miners(w)
     check_failed_units(w, now)
     check_usenet_stall(w, now)

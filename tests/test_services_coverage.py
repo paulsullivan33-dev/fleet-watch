@@ -200,6 +200,7 @@ class CoverageTests(unittest.TestCase):
 paul@192.168.1.85
 paul@192.168.1.109
 paul@192.168.1.119
+paul@192.168.1.118
 paul@192.168.1.130   # galaxy
 paul@192.168.1.150
 paul@192.168.1.171
@@ -227,7 +228,8 @@ paul@192.168.1.119
     def test_parse_machines(self):
         self.assertEqual(fw.parse_machines(self.MACHINES),
                          ["paul@192.168.1.85", "paul@192.168.1.109",
-                          "paul@192.168.1.119", "paul@192.168.1.130",
+                          "paul@192.168.1.119", "paul@192.168.1.118",
+                          "paul@192.168.1.130",
                           "paul@192.168.1.150", "paul@192.168.1.171"])
 
     def test_union_minus_self_peer_and_dupes(self):
@@ -386,3 +388,61 @@ class TriageBudgetTests(unittest.TestCase):
 
     def test_default_budget_leaves_room_under_cron_limit(self):
         self.assertLessEqual(int(fw.DEFAULTS["TRIAGE_BUDGET_SEC"]), 300)
+
+
+class MachinesTruthTests(unittest.TestCase):
+    """MACHINES is the source of truth (Paul, 2026-11-21): conf host
+    lists may only name machines that are in MACHINES. A stale entry
+    (the retired Yoga at .230, the nonexistent .165) must be skipped,
+    never probed."""
+
+    MACHINES = "paul@192.168.1.119\npaul@192.168.1.171\n"
+
+    def make(self, tmp, conf_text):
+        w = make_watcher(
+            tmp,
+            'MACHINES_SOURCE="paul@192.168.1.119:~/MACHINES"\n' + conf_text)
+        w.run = StubRun([
+            ("hostname -I", (0, "192.168.1.109\n")),
+            ("cat ~/MACHINES", (0, self.MACHINES)),
+            ("systemctl", (0, "")),
+        ])
+        return w
+
+    def test_fleet_hosts_drops_conf_host_not_in_machines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = self.make(tmp, 'FLEET_HOSTS="paul@192.168.1.119 '
+                               'paul@192.168.1.230"\n')
+            hosts = fw.fleet_hosts(w, NOW)
+            self.assertNotIn("paul@192.168.1.230", hosts)
+            self.assertIn("paul@192.168.1.119", hosts)
+            self.assertTrue(any("192.168.1.230" in r and "not in MACHINES" in r
+                                for r in w.report))
+
+    def test_failed_units_never_probes_phantoms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = self.make(tmp, 'FAILED_UNIT_HOSTS="paul@192.168.1.119 '
+                               'paul@192.168.1.230"\n')
+            fw.check_failed_units(w, NOW)
+            probed = " ".join(" ".join(c) for c in w.run.calls)
+            self.assertIn("192.168.1.119", probed)
+            self.assertNotIn("192.168.1.230", probed)
+
+    def test_enforce_keeps_bare_ips_and_localhost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = self.make(tmp, "")
+            kept = fw.enforce_machines(
+                w, ["192.168.1.119", "192.168.1.230", "localhost"], NOW,
+                "FILELIST_HOSTS")
+            self.assertEqual(kept, ["192.168.1.119", "localhost"])
+
+    def test_no_roster_means_no_filtering(self):
+        # MACHINES_SOURCE unset: no roster to enforce against, so conf
+        # lists pass through untouched (no answer is not an empty list).
+        with tempfile.TemporaryDirectory() as tmp:
+            w = make_watcher(tmp, 'FAILED_UNIT_HOSTS="paul@h1 paul@h2"\n')
+            w.run = StubRun([("systemctl", (0, ""))])
+            fw.check_failed_units(w, NOW)
+            probed = " ".join(" ".join(c) for c in w.run.calls)
+            self.assertIn("paul@h1", probed)
+            self.assertIn("paul@h2", probed)
